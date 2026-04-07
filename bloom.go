@@ -20,21 +20,21 @@ func (bv *bitvec) bitlen() int {
 }
 
 func (bv *bitvec) check(index int) bool {
-	i, bit := coord(index)
-	return (bv.bits[i] & bit) > 0
+	i := index >> 6
+	bit := uint64(1) << (uint(index) & 0b111111)
+	return bv.bits[i]&bit != 0
 }
 
 func (bv *bitvec) set(index int) bool {
-	i, bit := coord(index)
-	prev := (bv.bits[i] & bit) > 0
+	i := index >> 6
+	bit := uint64(1) << (uint(index) & 0b111111)
+	prev := bv.bits[i]&bit != 0
 	bv.bits[i] |= bit
 	return prev
 }
 
 func (bv *bitvec) clear() {
-	for i := range len(bv.bits) {
-		bv.bits[i] = 0
-	}
+	clear(bv.bits)
 }
 
 func (bv *bitvec) union(other *bitvec) {
@@ -42,8 +42,20 @@ func (bv *bitvec) union(other *bitvec) {
 		panic("mismatch length in bytes union")
 	}
 
-	for i := range len(bv.bits) {
-		bv.bits[i] |= other.bits[i]
+	bits := bv.bits
+	otherBits := other.bits
+	n := len(bits)
+	i := 0
+
+	for ; i+4 <= n; i += 4 {
+		bits[i] |= otherBits[i]
+		bits[i+1] |= otherBits[i+1]
+		bits[i+2] |= otherBits[i+2]
+		bits[i+3] |= otherBits[i+3]
+	}
+
+	for ; i < n; i++ {
+		bits[i] |= otherBits[i]
 	}
 }
 
@@ -52,8 +64,20 @@ func (bv *bitvec) intersect(other *bitvec) {
 		panic("mismatch length in bytes interest")
 	}
 
-	for i := range len(bv.bits) {
-		bv.bits[i] &= other.bits[i]
+	bits := bv.bits
+	otherBits := other.bits
+	n := len(bits)
+	i := 0
+
+	for ; i+4 <= n; i += 4 {
+		bits[i] &= otherBits[i]
+		bits[i+1] &= otherBits[i+1]
+		bits[i+2] &= otherBits[i+2]
+		bits[i+3] &= otherBits[i+3]
+	}
+
+	for ; i < n; i++ {
+		bits[i] &= otherBits[i]
 	}
 }
 
@@ -62,8 +86,22 @@ func (bv *bitvec) eq(other *bitvec) bool {
 		return false
 	}
 
-	for i := range len(bv.bits) {
-		if bv.bits[i] != other.bits[i] {
+	bits := bv.bits
+	otherBits := other.bits
+	n := len(bits)
+	i := 0
+
+	for ; i+4 <= n; i += 4 {
+		if (bits[i]^otherBits[i])|
+			(bits[i+1]^otherBits[i+1])|
+			(bits[i+2]^otherBits[i+2])|
+			(bits[i+3]^otherBits[i+3]) != 0 {
+			return false
+		}
+	}
+
+	for ; i < n; i++ {
+		if bits[i] != otherBits[i] {
 			return false
 		}
 	}
