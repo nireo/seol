@@ -1,9 +1,9 @@
 .PHONY: test-all benchmark-all
 
-BENCHTIME ?= 100ms
+BENCHTIME ?= 250ms
 
-test-all:
+test:
 	go test ./...
 
-benchmark-all:
+bench:
 	go test -run=^$$ -bench=. -benchtime=$(BENCHTIME) ./...

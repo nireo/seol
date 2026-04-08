@@ -1,214 +1,247 @@
 package seol
 
 import (
+	"strconv"
 	"testing"
+
+	"github.com/zeebo/xxh3"
 )
 
-var (
-	bitvecBoolSink bool
-	bitvecSink     *bitvec
-)
+// avoid results being optimized away
+var benchmarkBoolSink bool
 
-const (
-	benchmarkBitvecBlocks   = 1024
-	benchmarkBitvecPoolSize = 256
-)
+func TestAddContains(t *testing.T) {
+	f := New(1024, 4)
 
-func newBenchmarkBitvec() *bitvec {
-	return &bitvec{bits: make([]uint64, benchmarkBitvecBlocks)}
-}
-
-func newFilledBenchmarkBitvec(fill func(int) uint64) *bitvec {
-	bv := newBenchmarkBitvec()
-	for i := range bv.bits {
-		bv.bits[i] = fill(i)
-	}
-	return bv
-}
-
-func benchmarkMutatingBitvecOp(b *testing.B, src, other *bitvec, op func(*bitvec, *bitvec)) {
-	pool := make([]*bitvec, benchmarkBitvecPoolSize)
-	for i := range pool {
-		pool[i] = src.clone()
-	}
-
-	dst := pool[0]
-	i := 0
-	for b.Loop() {
-		if i == len(pool) {
-			b.StopTimer()
-			for _, bv := range pool {
-				copy(bv.bits, src.bits)
-			}
-			b.StartTimer()
-			i = 0
+	for i := range 5000 {
+		value := "member-" + strconv.Itoa(i)
+		if f.AddString(value) && i == 0 {
+			t.Fatalf("first insert reported already present")
 		}
-
-		dst = pool[i]
-		op(dst, other)
-		i++
 	}
 
-	bitvecSink = dst
-}
-
-func TestBitvecCoord(t *testing.T) {
-	block, bit := coord(0)
-	if block != 0 || bit != 1 {
-		t.Errorf("coord(0): got (%d, %d), want (0, 1)", block, bit)
-	}
-
-	block, bit = coord(63)
-	if block != 0 || bit != (1<<63) {
-		t.Errorf("coord(63): got (%d, %d), want (0, 1<<63)", block, bit)
-	}
-
-	block, bit = coord(64)
-	if block != 1 || bit != 1 {
-		t.Errorf("coord(64): got (%d, %d), want (1, 1)", block, bit)
-	}
-}
-
-func TestBitvecBitlen(t *testing.T) {
-	bv := &bitvec{bits: make([]uint64, 2)}
-	if bv.bitlen() != 128 { // 2 uint64s = 16 bytes = 128 bits
-		t.Errorf("bitlen: got %d, want 16", bv.bitlen())
-	}
-}
-
-func TestBitvecCheck(t *testing.T) {
-	bv := &bitvec{bits: make([]uint64, 1)}
-	if bv.check(0) {
-		t.Error("check(0): want false, got true")
-	}
-
-	bv.set(0)
-	if !bv.check(0) {
-		t.Error("check(0): want true, got false")
-	}
-
-	bv.set(63)
-	if !bv.check(63) {
-		t.Error("check(63): want true, got false")
-	}
-}
-
-func TestBitvecSet(t *testing.T) {
-	bv := &bitvec{bits: make([]uint64, 1)}
-
-	if bv.set(0) {
-		t.Error("set(0): want false (first set), got true")
-	}
-
-	if !bv.set(0) {
-		t.Error("set(0): want true (already set), got false")
-	}
-}
-
-func TestBitvecUnion(t *testing.T) {
-	bv1 := &bitvec{bits: []uint64{0b0001, 0b0000}}
-	bv2 := &bitvec{bits: []uint64{0b0010, 0b1000}}
-
-	bv1.union(bv2)
-
-	if bv1.bits[0] != 0b0011 {
-		t.Errorf("union: bits[0] got %b, want 0b0011", bv1.bits[0])
-	}
-	if bv1.bits[1] != 0b1000 {
-		t.Errorf("union: bits[1] got %b, want 0b1000", bv1.bits[1])
-	}
-}
-
-func TestBitvecIntersect(t *testing.T) {
-	bv1 := &bitvec{bits: []uint64{0b1101}}
-	bv2 := &bitvec{bits: []uint64{0b1011}}
-
-	bv1.intersect(bv2)
-
-	if bv1.bits[0] != 0b1001 {
-		t.Errorf("intersect: got %b, want 0b1001", bv1.bits[0])
-	}
-}
-
-func TestBitvecEq(t *testing.T) {
-	bv1 := &bitvec{bits: []uint64{0b1101}}
-	bv2 := &bitvec{bits: []uint64{0b1101}}
-	bv3 := &bitvec{bits: []uint64{0b1011}}
-
-	if !bv1.eq(bv2) {
-		t.Error("eq: equal vectors should be equal")
-	}
-	if bv1.eq(bv3) {
-		t.Error("eq: different vectors should not be equal")
-	}
-
-	bv4 := &bitvec{bits: []uint64{0b1101, 0b0000}}
-	if bv1.eq(bv4) {
-		t.Error("eq: different length vectors should not be equal")
-	}
-}
-
-func BenchmarkBitvecCheck(b *testing.B) {
-	bv := newBenchmarkBitvec()
-	bv.set(500)
-	var ok bool
-	for b.Loop() {
-		ok = bv.check(500)
-	}
-	bitvecBoolSink = ok
-}
-
-func BenchmarkBitvecSet(b *testing.B) {
-	bv := newBenchmarkBitvec()
-	bitlen := bv.bitlen()
-	var wasSet bool
-	i := 0
-	for b.Loop() {
-		if i > 0 && i%bitlen == 0 {
-			b.StopTimer()
-			bv.clear()
-			b.StartTimer()
+	for i := range 5000 {
+		value := "member-" + strconv.Itoa(i)
+		if !f.ContainsString(value) {
+			t.Fatalf("missing inserted value %q", value)
 		}
-		wasSet = bv.set(i % bitlen)
-		i++
-	}
-	bitvecBoolSink = wasSet
-}
-
-func BenchmarkBitvecClear(b *testing.B) {
-	bv := newBenchmarkBitvec()
-	for b.Loop() {
-		bv.clear()
 	}
 }
 
-func BenchmarkBitvecUnion(b *testing.B) {
-	bv1 := newFilledBenchmarkBitvec(func(i int) uint64 { return ^uint64(i) })
-	bv2 := newFilledBenchmarkBitvec(func(i int) uint64 { return uint64(i) })
-	benchmarkMutatingBitvecOp(b, bv1, bv2, (*bitvec).union)
-}
+func TestRepeatInsert(t *testing.T) {
+	f := New(1024, 4)
 
-func BenchmarkBitvecIntersect(b *testing.B) {
-	bv1 := newFilledBenchmarkBitvec(func(i int) uint64 { return uint64(i) })
-	bv2 := newFilledBenchmarkBitvec(func(i int) uint64 { return uint64(i) >> 1 })
-	benchmarkMutatingBitvecOp(b, bv1, bv2, (*bitvec).intersect)
-}
-
-func BenchmarkBitvecEq(b *testing.B) {
-	bv1 := newFilledBenchmarkBitvec(func(i int) uint64 { return uint64(i) })
-	bv2 := newFilledBenchmarkBitvec(func(i int) uint64 { return uint64(i) })
-	var eq bool
-	for b.Loop() {
-		eq = bv1.eq(bv2)
+	if f.AddString("hello") {
+		t.Fatalf("first insert should report false")
 	}
-	bitvecBoolSink = eq
+	if !f.AddString("hello") {
+		t.Fatalf("second insert should report true")
+	}
 }
 
-func BenchmarkBitvecClone(b *testing.B) {
-	bv := newFilledBenchmarkBitvec(func(i int) uint64 { return uint64(i) })
-	var clone *bitvec
-	for b.Loop() {
-		clone = bv.clone()
+func TestReset(t *testing.T) {
+	f := New(4096, 4)
+
+	for i := range 1000 {
+		f.AddString("member-" + strconv.Itoa(i))
 	}
-	bitvecSink = clone
+	f.Reset()
+
+	for i := range 1000 {
+		value := "member-" + strconv.Itoa(i)
+		if f.ContainsString(value) {
+			t.Fatalf("value %q still present after reset", value)
+		}
+	}
+}
+
+func TestSeededFiltersAreDeterministic(t *testing.T) {
+	left := NewForSeeded(2000, 0.01, 42)
+	right := NewForSeeded(2000, 0.01, 42)
+	otherSeed := NewForSeeded(2000, 0.01, 43)
+
+	for i := range 2000 {
+		value := "member-" + strconv.Itoa(i)
+		left.AddString(value)
+		right.AddString(value)
+		otherSeed.AddString(value)
+	}
+
+	if !equalWords(left.words, right.words) {
+		t.Fatalf("same seed produced different filters")
+	}
+	if equalWords(left.words, otherSeed.words) {
+		t.Fatalf("different seeds produced the same filter")
+	}
+}
+
+func TestAddHashMatchesHashedPaths(t *testing.T) {
+	f := NewSeeded(2048, 4, 99)
+	hash := xxh3.HashStringSeed("shared", f.seed)
+
+	if f.AddHash(hash) {
+		t.Fatalf("first prehashed insert should report false")
+	}
+	if !f.ContainsString("shared") {
+		t.Fatalf("string path did not match prehashed insert")
+	}
+	if !f.Contains([]byte("shared")) {
+		t.Fatalf("byte path did not match prehashed insert")
+	}
+}
+
+func TestNewForChoosesUsableParameters(t *testing.T) {
+	f := NewFor(1000, 0.01)
+
+	if f.NumBits() < 64 {
+		t.Fatalf("unexpected bit count %d", f.NumBits())
+	}
+	if f.NumHashes() < 1 {
+		t.Fatalf("unexpected hash count %d", f.NumHashes())
+	}
+}
+
+func TestFalsePositiveRateIsReasonable(t *testing.T) {
+	const (
+		expectedItems = 5000
+		targetFP      = 0.01
+		samples       = 50000
+	)
+
+	f := NewForSeeded(expectedItems, targetFP, 7)
+	for i := range expectedItems {
+		f.AddString("member-" + strconv.Itoa(i))
+	}
+
+	falsePositives := 0
+	for i := expectedItems; i < expectedItems+samples; i++ {
+		if f.ContainsString("non-member-" + strconv.Itoa(i)) {
+			falsePositives++
+		}
+	}
+
+	rate := float64(falsePositives) / float64(samples)
+	if rate > targetFP*1.5 {
+		t.Fatalf("false positive rate too high: got %.4f want <= %.4f", rate, targetFP*1.5)
+	}
+}
+
+func BenchmarkAddString(b *testing.B) {
+	values := benchmarkStrings()
+	f := NewForSeeded(len(values), 0.01, 1)
+	b.ReportAllocs()
+
+	var result bool
+	for i := 0; b.Loop(); i++ {
+		result = f.AddString(values[i%len(values)])
+	}
+	benchmarkBoolSink = result
+}
+
+func BenchmarkContainsString(b *testing.B) {
+	values := benchmarkStrings()
+	f := NewForSeeded(len(values), 0.01, 1)
+	for _, value := range values {
+		f.AddString(value)
+	}
+	b.ReportAllocs()
+
+	var result bool
+	for i := 0; b.Loop(); i++ {
+		result = f.ContainsString(values[i%len(values)])
+	}
+	benchmarkBoolSink = result
+}
+
+func BenchmarkAddBytes(b *testing.B) {
+	values := benchmarkBytes()
+	f := NewForSeeded(len(values), 0.01, 1)
+	b.ReportAllocs()
+
+	var result bool
+	for i := 0; b.Loop(); i++ {
+		result = f.Add(values[i%len(values)])
+	}
+	benchmarkBoolSink = result
+}
+
+func BenchmarkContainsBytes(b *testing.B) {
+	values := benchmarkBytes()
+	f := NewForSeeded(len(values), 0.01, 1)
+	for _, value := range values {
+		f.Add(value)
+	}
+	b.ReportAllocs()
+
+	var result bool
+	for i := 0; b.Loop(); i++ {
+		result = f.Contains(values[i%len(values)])
+	}
+	benchmarkBoolSink = result
+}
+
+func BenchmarkAddHash(b *testing.B) {
+	hashes := benchmarkHashes(1)
+	f := NewForSeeded(len(hashes), 0.01, 1)
+	b.ReportAllocs()
+
+	var result bool
+	for i := 0; b.Loop(); i++ {
+		result = f.AddHash(hashes[i%len(hashes)])
+	}
+	benchmarkBoolSink = result
+}
+
+func BenchmarkContainsHash(b *testing.B) {
+	hashes := benchmarkHashes(1)
+	f := NewForSeeded(len(hashes), 0.01, 1)
+	for _, hash := range hashes {
+		f.AddHash(hash)
+	}
+	b.ReportAllocs()
+
+	var result bool
+	for i := 0; b.Loop(); i++ {
+		result = f.ContainsHash(hashes[i%len(hashes)])
+	}
+	benchmarkBoolSink = result
+}
+
+func equalWords(left, right []uint64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func benchmarkStrings() []string {
+	const size = 1 << 16
+	values := make([]string, size)
+	for i := range values {
+		values[i] = "member-" + strconv.Itoa(i)
+	}
+	return values
+}
+
+func benchmarkBytes() [][]byte {
+	strings := benchmarkStrings()
+	values := make([][]byte, len(strings))
+	for i, value := range strings {
+		values[i] = []byte(value)
+	}
+	return values
+}
+
+func benchmarkHashes(seed uint64) []uint64 {
+	strings := benchmarkStrings()
+	hashes := make([]uint64, len(strings))
+	for i, value := range strings {
+		hashes[i] = xxh3.HashStringSeed(value, seed)
+	}
+	return hashes
 }
