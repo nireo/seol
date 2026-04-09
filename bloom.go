@@ -192,5 +192,6 @@ func optimalBits(expectedItems int, falsePositiveRate float64) int {
 	if bits < 64 {
 		return 64
 	}
+
 	return int(bits)
 }
