@@ -1,4 +1,4 @@
-package seol
+package bloom
 
 import (
 	"bytes"
@@ -138,14 +138,14 @@ func TestMarshalBinaryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
-	if len(data) != bloomHeaderSize+len(original.words)*8 {
-		t.Fatalf("encoded length: got %d, want %d", len(data), bloomHeaderSize+len(original.words)*8)
+	if len(data) != HeaderSize+len(original.words)*8 {
+		t.Fatalf("encoded length: got %d, want %d", len(data), HeaderSize+len(original.words)*8)
 	}
-	if got := binary.LittleEndian.Uint32(data); got != bloomMagic {
-		t.Fatalf("magic: got %#x, want %#x", got, bloomMagic)
+	if got := binary.LittleEndian.Uint32(data); got != Magic {
+		t.Fatalf("magic: got %#x, want %#x", got, Magic)
 	}
-	if got := data[4]; got != bloomVersion {
-		t.Fatalf("version: got %d, want %d", got, bloomVersion)
+	if got := data[4]; got != Version {
+		t.Fatalf("version: got %d, want %d", got, Version)
 	}
 
 	decoded, err := ReadFilter(data)

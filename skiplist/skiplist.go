@@ -1,4 +1,4 @@
-package seol
+package skiplist
 
 import (
 	"bytes"
@@ -25,13 +25,13 @@ const (
 	heightIncrease = ^uint32(0) / 3
 )
 
-// arena implements a lock-free arena. offset=0 is a nil pointer
+// arena implements a lock-free arena. offset=0 is a nil pointer.
 type arena struct {
 	n   atomic.Uint32
 	buf []byte
 }
 
-type skiplist struct {
+type Skiplist struct {
 	height  atomic.Int32
 	head    *node
 	ref     atomic.Int32
@@ -40,7 +40,7 @@ type skiplist struct {
 }
 
 type Iterator struct {
-	list *skiplist
+	list *Skiplist
 	n    *node
 }
 
@@ -106,11 +106,11 @@ func (s *arena) getNodeOffset(n *node) uint32 {
 	return uint32(uintptr(unsafe.Pointer(n)) - uintptr(unsafe.Pointer(&s.buf[0])))
 }
 
-func (s *skiplist) incrRef() {
+func (s *Skiplist) incrRef() {
 	s.ref.Add(1)
 }
 
-func (s *skiplist) decrRef() {
+func (s *Skiplist) decrRef() {
 	newRef := s.ref.Add(-1)
 	if newRef > 0 {
 		return
@@ -147,10 +147,10 @@ func newNode(arena *arena, key []byte, v []byte, height int) *node {
 	return node
 }
 
-func newSkiplist(arenaSize int64) *skiplist {
+func New(arenaSize int64) *Skiplist {
 	arena := newArena(arenaSize)
 	head := newNode(arena, nil, nil, maxHeight)
-	s := &skiplist{head: head, arena: arena}
+	s := &Skiplist{head: head, arena: arena}
 	s.height.Store(1)
 	s.ref.Store(1)
 
@@ -180,7 +180,7 @@ func (s *node) casNextOffset(h int, old, val uint32) bool {
 	return s.tower[h].CompareAndSwap(old, val)
 }
 
-func (s *skiplist) randomHeight() int {
+func (s *Skiplist) randomHeight() int {
 	h := 1
 	for h < maxHeight && rand.Uint32() <= heightIncrease {
 		h++
@@ -188,11 +188,11 @@ func (s *skiplist) randomHeight() int {
 	return h
 }
 
-func (s *skiplist) getNext(nd *node, height int) *node {
+func (s *Skiplist) getNext(nd *node, height int) *node {
 	return s.arena.getNode(nd.getNextOffset(height))
 }
 
-func (s *skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool) {
+func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool) {
 	x := s.head
 	level := int(s.getHeight() - 1)
 	for {
@@ -243,7 +243,7 @@ func (s *skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool
 	}
 }
 
-func (s *skiplist) findSpliceForLevel(key []byte, before *node, level int) (*node, *node) {
+func (s *Skiplist) findSpliceForLevel(key []byte, before *node, level int) (*node, *node) {
 	for {
 		next := s.getNext(before, level)
 		if next == nil {
@@ -262,11 +262,11 @@ func (s *skiplist) findSpliceForLevel(key []byte, before *node, level int) (*nod
 	}
 }
 
-func (s *skiplist) getHeight() int32 {
+func (s *Skiplist) getHeight() int32 {
 	return s.height.Load()
 }
 
-func (s *skiplist) put(key []byte, v []byte) {
+func (s *Skiplist) Put(key []byte, v []byte) {
 	listHeight := s.getHeight()
 	var prev [maxHeight + 1]*node
 	var next [maxHeight + 1]*node
@@ -321,11 +321,11 @@ func (s *skiplist) put(key []byte, v []byte) {
 	}
 }
 
-func (s *skiplist) empty() bool {
+func (s *Skiplist) Empty() bool {
 	return s.findLast() == nil
 }
 
-func (s *skiplist) findLast() *node {
+func (s *Skiplist) findLast() *node {
 	n := s.head
 	level := int(s.getHeight()) - 1
 	for {
@@ -344,7 +344,7 @@ func (s *skiplist) findLast() *node {
 	}
 }
 
-func (s *skiplist) get(key []byte) []byte {
+func (s *Skiplist) Get(key []byte) []byte {
 	n, _ := s.findNear(key, false, true)
 	if n == nil {
 		return nil
@@ -357,16 +357,16 @@ func (s *skiplist) get(key []byte) []byte {
 	return s.arena.getVal(valOffset, valSize)
 }
 
-func (s *skiplist) newIterator() *Iterator {
+func (s *Skiplist) NewIterator() *Iterator {
 	s.incrRef()
 	return &Iterator{list: s}
 }
 
-func (s *skiplist) memSize() int64 {
+func (s *Skiplist) MemSize() int64 {
 	return s.arena.size()
 }
 
-func (it *Iterator) close() {
+func (it *Iterator) Close() {
 	if it.list == nil {
 		return
 	}
@@ -375,56 +375,56 @@ func (it *Iterator) close() {
 	it.n = nil
 }
 
-func (it *Iterator) valid() bool {
+func (it *Iterator) Valid() bool {
 	return it != nil && it.n != nil
 }
 
-func (it *Iterator) key() []byte {
-	if !it.valid() {
+func (it *Iterator) Key() []byte {
+	if !it.Valid() {
 		return nil
 	}
 	return it.n.key(it.list.arena)
 }
 
-func (it *Iterator) value() []byte {
-	if !it.valid() {
+func (it *Iterator) Value() []byte {
+	if !it.Valid() {
 		return nil
 	}
 	valOffset, valSize := it.n.getValueOffset()
 	return it.list.arena.getVal(valOffset, valSize)
 }
 
-func (it *Iterator) seek(target []byte) {
+func (it *Iterator) Seek(target []byte) {
 	it.n, _ = it.list.findNear(target, false, true)
 }
 
-func (it *Iterator) seekForPrev(target []byte) {
+func (it *Iterator) SeekForPrev(target []byte) {
 	it.n, _ = it.list.findNear(target, true, true)
 }
 
-func (it *Iterator) seekToFirst() {
+func (it *Iterator) SeekToFirst() {
 	it.n = it.list.getNext(it.list.head, 0)
 }
 
-func (it *Iterator) seekToLast() {
+func (it *Iterator) SeekToLast() {
 	it.n = it.list.findLast()
 }
 
-func (it *Iterator) rewind() {
-	it.seekToFirst()
+func (it *Iterator) Rewind() {
+	it.SeekToFirst()
 }
 
-func (it *Iterator) next() {
-	if !it.valid() {
+func (it *Iterator) Next() {
+	if !it.Valid() {
 		return
 	}
 	it.n = it.list.getNext(it.n, 0)
 }
 
-func (it *Iterator) prev() {
-	if !it.valid() {
-		it.seekToLast()
+func (it *Iterator) Prev() {
+	if !it.Valid() {
+		it.SeekToLast()
 		return
 	}
-	it.n, _ = it.list.findNear(it.key(), true, false)
+	it.n, _ = it.list.findNear(it.Key(), true, false)
 }

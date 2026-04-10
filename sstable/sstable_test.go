@@ -1,4 +1,4 @@
-package seol
+package sstable
 
 import (
 	"bytes"
@@ -6,6 +6,9 @@ import (
 	"os"
 	"strconv"
 	"testing"
+
+	"github.com/nireo/seol/bloom"
+	"github.com/nireo/seol/skiplist"
 )
 
 func TestTableIndexEncodeDecodeFullRange(t *testing.T) {
@@ -46,7 +49,7 @@ func TestTableIndexEncodeDecodeFullRange(t *testing.T) {
 
 func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 	dir := t.TempDir()
-	s := newSkiplist(1 << 20)
+	s := skiplist.New(1 << 20)
 
 	type kv struct {
 		key   string
@@ -61,14 +64,14 @@ func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 		{key: "d", value: bytes.Repeat([]byte{'D'}, 1400)},
 	}
 	for _, entry := range inserted {
-		s.put([]byte(entry.key), entry.value)
+		s.Put([]byte(entry.key), entry.value)
 	}
 
-	sst, err := flushSkiplist(dir, s)
+	sst, err := Flush(dir, s)
 	if err != nil {
-		t.Fatalf("flushSkiplist: %v", err)
+		t.Fatalf("Flush: %v", err)
 	}
-	defer func() { _ = sst.close() }()
+	defer func() { _ = sst.Close() }()
 
 	data, err := os.ReadFile(sst.f.Name())
 	if err != nil {
@@ -78,12 +81,19 @@ func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 		t.Fatalf("sstable too small: got %d bytes", len(data))
 	}
 
-	bloomSize := bloomHeaderSize + len(sst.filter.words)*8
-	storedBloom, err := ReadFilter(data[:bloomSize])
+	bloomData, err := sst.filter.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	storedBloom, err := bloom.ReadFilter(data[:len(bloomData)])
 	if err != nil {
 		t.Fatalf("ReadFilter: %v", err)
 	}
-	if !equalWords(storedBloom.words, sst.filter.words) {
+	storedBloomData, err := storedBloom.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary stored bloom: %v", err)
+	}
+	if !bytes.Equal(storedBloomData, bloomData) {
 		t.Fatalf("stored bloom differs from in-memory bloom")
 	}
 	for _, key := range []string{"a", "b", "c", "d", "e"} {
@@ -137,7 +147,7 @@ func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 		{key: "e", value: bytes.Repeat([]byte{'E'}, 1400)},
 	}
 
-	dataEnd := uint64(bloomSize)
+	dataEnd := uint64(len(bloomData))
 	entryIdx := 0
 	for i, ra := range decoded.ranges {
 		if ra.length == 0 || int(ra.length) > sstableBlockSize {
@@ -200,11 +210,11 @@ func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 
 func TestFlushSkiplistRejectsOversizedEntry(t *testing.T) {
 	dir := t.TempDir()
-	s := newSkiplist(1 << 20)
-	s.put([]byte("a"), bytes.Repeat([]byte{'x'}, sstableBlockSize))
+	s := skiplist.New(1 << 20)
+	s.Put([]byte("a"), bytes.Repeat([]byte{'x'}, sstableBlockSize))
 
-	if _, err := flushSkiplist(dir, s); err == nil {
-		t.Fatalf("flushSkiplist: expected oversized entry error")
+	if _, err := Flush(dir, s); err == nil {
+		t.Fatalf("Flush: expected oversized entry error")
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -218,7 +228,7 @@ func TestFlushSkiplistRejectsOversizedEntry(t *testing.T) {
 
 func TestOpenSSTableGet(t *testing.T) {
 	dir := t.TempDir()
-	s := newSkiplist(1 << 20)
+	s := skiplist.New(1 << 20)
 
 	expected := map[string][]byte{
 		"a": bytes.Repeat([]byte{'A'}, 1400),
@@ -228,28 +238,28 @@ func TestOpenSSTableGet(t *testing.T) {
 		"e": bytes.Repeat([]byte{'E'}, 1400),
 	}
 	for key, value := range expected {
-		s.put([]byte(key), value)
+		s.Put([]byte(key), value)
 	}
 
-	flushed, err := flushSkiplist(dir, s)
+	flushed, err := Flush(dir, s)
 	if err != nil {
-		t.Fatalf("flushSkiplist: %v", err)
+		t.Fatalf("Flush: %v", err)
 	}
 	path := flushed.f.Name()
-	if err := flushed.close(); err != nil {
+	if err := flushed.Close(); err != nil {
 		t.Fatalf("close flushed table: %v", err)
 	}
 
-	loaded, err := openSSTable(path)
+	loaded, err := Open(path)
 	if err != nil {
-		t.Fatalf("openSSTable: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	if loaded.filter == nil {
 		t.Fatalf("expected bloom filter to be loaded")
 	}
 
 	for key, want := range expected {
-		got, err := loaded.get([]byte(key))
+		got, err := loaded.Get([]byte(key))
 		if err != nil {
 			t.Fatalf("get %q: %v", key, err)
 		}
@@ -258,7 +268,7 @@ func TestOpenSSTableGet(t *testing.T) {
 		}
 	}
 
-	got, err := loaded.get([]byte("aa"))
+	got, err := loaded.Get([]byte("aa"))
 	if err != nil {
 		t.Fatalf("get aa: %v", err)
 	}
@@ -266,7 +276,7 @@ func TestOpenSSTableGet(t *testing.T) {
 		t.Fatalf("get aa: got %q, want nil", got)
 	}
 
-	got, err = loaded.get([]byte("z"))
+	got, err = loaded.Get([]byte("z"))
 	if err != nil {
 		t.Fatalf("get z: %v", err)
 	}
@@ -286,11 +296,11 @@ func TestOpenSSTableGet(t *testing.T) {
 		t.Fatalf("failed to find bloom-negative key")
 	}
 
-	if err := loaded.close(); err != nil {
+	if err := loaded.Close(); err != nil {
 		t.Fatalf("close loaded table: %v", err)
 	}
 
-	got, err = loaded.get([]byte(missing))
+	got, err = loaded.Get([]byte(missing))
 	if err != nil {
 		t.Fatalf("get %q after close: %v", missing, err)
 	}

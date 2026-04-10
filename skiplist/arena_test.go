@@ -1,4 +1,4 @@
-package seol
+package skiplist
 
 import (
 	"bytes"

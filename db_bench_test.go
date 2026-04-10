@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/nireo/seol/sstable"
 )
 
 const (
@@ -244,10 +246,10 @@ func benchmarkStopDBWithoutFlush(b *testing.B, db *DB) {
 	db.wg.Wait()
 
 	db.mu.RLock()
-	sstables := append([]*sstable(nil), db.sstables...)
+	sstables := append([]*sstable.Table(nil), db.sstables...)
 	db.mu.RUnlock()
 	for _, sst := range sstables {
-		if err := sst.close(); err != nil {
+		if err := sst.Close(); err != nil {
 			b.Fatalf("close sstable: %v", err)
 		}
 	}

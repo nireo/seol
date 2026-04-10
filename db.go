@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nireo/seol/skiplist"
+	"github.com/nireo/seol/sstable"
 )
 
 const (
@@ -17,7 +20,7 @@ const (
 )
 
 type immutableMemtable struct {
-	table    *skiplist
+	table    *skiplist.Skiplist
 	walPaths []string
 }
 
@@ -30,12 +33,12 @@ type DB struct {
 	dir              string
 	memtableMaxBytes int64
 	walSyncInterval  time.Duration
-	memtable         *skiplist
+	memtable         *skiplist.Skiplist
 	activeWal        *wal
 	currentWalPaths  []string
 	immutable        []*immutableMemtable
-	sstables         []*sstable // newest first
-	flushFn          func(baseDir string, sk *skiplist) (*sstable, error)
+	sstables         []*sstable.Table // newest first
+	flushFn          func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)
 	flushCh          chan *immutableMemtable
 
 	mu       sync.RWMutex
@@ -49,15 +52,15 @@ func Open(dir string) (*DB, error) {
 }
 
 func OpenWithOptions(dir string, opts Options) (*DB, error) {
-	return openDB(dir, opts, flushSkiplist)
+	return openDB(dir, opts, sstable.Flush)
 }
 
-func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist) (*sstable, error)) (*DB, error) {
+func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)) (*DB, error) {
 	if opts.MemtableMaxBytes <= 0 {
 		opts.MemtableMaxBytes = defaultMemtableMaxBytes
 	}
 	if flushFn == nil {
-		flushFn = flushSkiplist
+		flushFn = sstable.Flush
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -91,26 +94,26 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist)
 		return filepath.Base(walPaths[i]) < filepath.Base(walPaths[j])
 	})
 
-	sstables := make([]*sstable, 0, len(sstPaths))
+	sstables := make([]*sstable.Table, 0, len(sstPaths))
 	for _, path := range sstPaths {
-		sst, err := openSSTable(path)
+		sst, err := sstable.Open(path)
 		if err != nil {
 			for _, opened := range sstables {
-				_ = opened.close()
+				_ = opened.Close()
 			}
 			return nil, err
 		}
 		sstables = append(sstables, sst)
 	}
 
-	memtable := newSkiplist(memtableArenaSize(opts.MemtableMaxBytes))
+	memtable := skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
 	for _, path := range walPaths {
 		if err := replayWAL(path, func(key, value []byte) error {
-			memtable.put(key, value)
+			memtable.Put(key, value)
 			return nil
 		}); err != nil {
 			for _, opened := range sstables {
-				_ = opened.close()
+				_ = opened.Close()
 			}
 			return nil, err
 		}
@@ -119,7 +122,7 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist)
 	activeWal, err := createWAL(dir, opts.WALSyncInterval)
 	if err != nil {
 		for _, opened := range sstables {
-			_ = opened.close()
+			_ = opened.Close()
 		}
 		return nil, err
 	}
@@ -167,8 +170,8 @@ func (db *DB) Put(key, value []byte) error {
 		return fmt.Errorf("seol: append wal: %w", err)
 	}
 
-	db.memtable.put(key, value)
-	if db.memtable.memSize() < db.memtableMaxBytes {
+	db.memtable.Put(key, value)
+	if db.memtable.MemSize() < db.memtableMaxBytes {
 		db.mu.Unlock()
 		return nil
 	}
@@ -190,7 +193,7 @@ func (db *DB) Put(key, value []byte) error {
 		walPaths: append([]string(nil), db.currentWalPaths...),
 	}
 	db.immutable = append(db.immutable, toFlush)
-	db.memtable = newSkiplist(memtableArenaSize(db.memtableMaxBytes))
+	db.memtable = skiplist.New(memtableArenaSize(db.memtableMaxBytes))
 	db.activeWal = nextWal
 	db.currentWalPaths = []string{nextWal.path}
 	db.mu.Unlock()
@@ -207,19 +210,19 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 	memtable := db.memtable
 	immutable := append([]*immutableMemtable(nil), db.immutable...)
-	sstables := append([]*sstable(nil), db.sstables...)
+	sstables := append([]*sstable.Table(nil), db.sstables...)
 	db.mu.RUnlock()
 
-	if value := memtable.get(key); value != nil {
+	if value := memtable.Get(key); value != nil {
 		return value, nil
 	}
 	for i := len(immutable) - 1; i >= 0; i-- {
-		if value := immutable[i].table.get(key); value != nil {
+		if value := immutable[i].table.Get(key); value != nil {
 			return value, nil
 		}
 	}
 	for _, sst := range sstables {
-		value, err := sst.get(key)
+		value, err := sst.Get(key)
 		if err != nil {
 			return nil, err
 		}
@@ -240,7 +243,7 @@ func (db *DB) Close() error {
 	db.closed = true
 
 	var toFlush *immutableMemtable
-	if db.memtable != nil && !db.memtable.empty() {
+	if db.memtable != nil && !db.memtable.Empty() {
 		if err := db.activeWal.close(); err != nil {
 			db.mu.Unlock()
 			return fmt.Errorf("seol: close wal: %w", err)
@@ -272,7 +275,7 @@ func (db *DB) Close() error {
 			closeErr = err
 		}
 		for _, sst := range db.sstables {
-			if closeSSTErr := sst.close(); closeSSTErr != nil && closeErr == nil {
+			if closeSSTErr := sst.Close(); closeSSTErr != nil && closeErr == nil {
 				closeErr = closeSSTErr
 			}
 		}
@@ -298,7 +301,7 @@ func (db *DB) Close() error {
 		closeErr = db.flushErr
 	}
 	for _, sst := range db.sstables {
-		if err := sst.close(); err != nil && closeErr == nil {
+		if err := sst.Close(); err != nil && closeErr == nil {
 			closeErr = err
 		}
 	}
@@ -331,7 +334,7 @@ func (db *DB) flushLoop() {
 		if idx >= 0 {
 			db.immutable = append(db.immutable[:idx], db.immutable[idx+1:]...)
 		}
-		db.sstables = append([]*sstable{sst}, db.sstables...)
+		db.sstables = append([]*sstable.Table{sst}, db.sstables...)
 		db.mu.Unlock()
 
 		for _, path := range imm.walPaths {

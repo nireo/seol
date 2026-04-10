@@ -1,4 +1,4 @@
-package seol
+package skiplist
 
 import (
 	"strconv"
@@ -15,19 +15,19 @@ func BenchmarkSkiplistPut(b *testing.B) {
 	const size = 1 << 14
 	keys := benchmarkSkiplistKeys(size)
 	values := benchmarkSkiplistValues(size)
-	s := newSkiplist(benchmarkSkiplistArenaSize(size))
+	s := New(benchmarkSkiplistArenaSize(size))
 	b.ReportAllocs()
 
 	for i := 0; b.Loop(); i++ {
 		if i > 0 && i%size == 0 {
 			b.StopTimer()
-			s = newSkiplist(benchmarkSkiplistArenaSize(size))
+			s = New(benchmarkSkiplistArenaSize(size))
 			b.StartTimer()
 		}
-		s.put(keys[i%size], values[i%size])
+		s.Put(keys[i%size], values[i%size])
 	}
 
-	benchmarkSkiplistIntSink = int(s.memSize())
+	benchmarkSkiplistIntSink = int(s.MemSize())
 }
 
 func BenchmarkSkiplistGet(b *testing.B) {
@@ -36,7 +36,7 @@ func BenchmarkSkiplistGet(b *testing.B) {
 
 	var value []byte
 	for i := 0; b.Loop(); i++ {
-		value = s.get(keys[i%len(keys)])
+		value = s.Get(keys[i%len(keys)])
 	}
 
 	benchmarkSkiplistBytesSink = value
@@ -44,14 +44,14 @@ func BenchmarkSkiplistGet(b *testing.B) {
 
 func BenchmarkSkiplistSeek(b *testing.B) {
 	s, keys, _ := newBenchmarkSkiplist(1 << 16)
-	it := s.newIterator()
-	defer it.close()
+	it := s.NewIterator()
+	defer it.Close()
 	b.ReportAllocs()
 
 	total := 0
 	for i := 0; b.Loop(); i++ {
-		it.seek(keys[i%len(keys)])
-		total += len(it.key()) + len(it.value())
+		it.Seek(keys[i%len(keys)])
+		total += len(it.Key()) + len(it.Value())
 	}
 
 	benchmarkSkiplistIntSink = total
@@ -59,18 +59,18 @@ func BenchmarkSkiplistSeek(b *testing.B) {
 
 func BenchmarkSkiplistIterate(b *testing.B) {
 	s, _, _ := newBenchmarkSkiplist(1 << 16)
-	it := s.newIterator()
-	defer it.close()
-	it.seekToFirst()
+	it := s.NewIterator()
+	defer it.Close()
+	it.SeekToFirst()
 	b.ReportAllocs()
 
 	total := 0
 	for b.Loop() {
-		if !it.valid() {
-			it.seekToFirst()
+		if !it.Valid() {
+			it.SeekToFirst()
 		}
-		total += len(it.key()) + len(it.value())
-		it.next()
+		total += len(it.Key()) + len(it.Value())
+		it.Next()
 	}
 
 	benchmarkSkiplistIntSink = total
@@ -96,12 +96,12 @@ func benchmarkSkiplistArenaSize(entries int) int64 {
 	return int64(entries+1)*int64(maxNodeSize+32) + (1 << 20)
 }
 
-func newBenchmarkSkiplist(size int) (*skiplist, [][]byte, [][]byte) {
+func newBenchmarkSkiplist(size int) (*Skiplist, [][]byte, [][]byte) {
 	keys := benchmarkSkiplistKeys(size)
 	values := benchmarkSkiplistValues(size)
-	s := newSkiplist(benchmarkSkiplistArenaSize(size))
+	s := New(benchmarkSkiplistArenaSize(size))
 	for i := range size {
-		s.put(keys[i], values[i])
+		s.Put(keys[i], values[i])
 	}
 	return s, keys, values
 }

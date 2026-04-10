@@ -6,11 +6,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nireo/seol/skiplist"
+	"github.com/nireo/seol/sstable"
 )
 
 func TestDBOpenCloseReload(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 10}, flushSkiplist)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 10}, sstable.Flush)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -59,7 +62,7 @@ func TestDBOpenCloseReload(t *testing.T) {
 
 func TestDBRecoversFromWAL(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, flushSkiplist)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, sstable.Flush)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -97,10 +100,10 @@ func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 	dir := t.TempDir()
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	flushFn := func(baseDir string, sk *skiplist) (*sstable, error) {
+	flushFn := func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error) {
 		started <- struct{}{}
 		<-release
-		return flushSkiplist(baseDir, sk)
+		return sstable.Flush(baseDir, sk)
 	}
 
 	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 10}, flushFn)
@@ -159,7 +162,7 @@ func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 
 func TestDBReadsNewestSSTableFirst(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(dir, Options{MemtableMaxBytes: 128}, flushSkiplist)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 128}, sstable.Flush)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -237,10 +240,10 @@ func stopDBWithoutFlush(t *testing.T, db *DB) {
 	db.wg.Wait()
 
 	db.mu.RLock()
-	sstables := append([]*sstable(nil), db.sstables...)
+	sstables := append([]*sstable.Table(nil), db.sstables...)
 	db.mu.RUnlock()
 	for _, sst := range sstables {
-		if err := sst.close(); err != nil {
+		if err := sst.Close(); err != nil {
 			t.Fatalf("close sstable: %v", err)
 		}
 	}
