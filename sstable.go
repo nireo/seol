@@ -2,10 +2,13 @@ package seol
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -88,6 +91,21 @@ func (ti *tableIndex) decodeFullRange(data []byte) {
 		ptr += dr.decode(data[ptr:])
 		ti.ranges = append(ti.ranges, dr)
 	}
+}
+
+func (ti *tableIndex) findDataRange(key []byte) *dataRange {
+	if len(ti.ranges) == 0 {
+		return nil
+	}
+
+	idx := sort.Search(len(ti.ranges), func(i int) bool {
+		return bytes.Compare(ti.ranges[i].firstKey, key) > 0
+	}) - 1
+	if idx < 0 {
+		return nil
+	}
+
+	return &ti.ranges[idx]
 }
 
 func sstableID() string {
@@ -200,9 +218,102 @@ func flushSkiplist(baseDir string, sk *skiplist) (*sstable, error) {
 	return sst, nil
 }
 
+func openSSTable(path string) (*sstable, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = file.Close()
+		}
+	}()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.Size() < int64(sstableFooterSize) {
+		return nil, fmt.Errorf("sstable: file too small")
+	}
+
+	footer := make([]byte, sstableFooterSize)
+	footerOffset := stat.Size() - int64(sstableFooterSize)
+	if _, err := file.ReadAt(footer, footerOffset); err != nil {
+		return nil, err
+	}
+
+	if got := binary.LittleEndian.Uint32(footer[8:]); got != sstableMagic {
+		return nil, fmt.Errorf("sstable: invalid magic %#x", got)
+	}
+	if got := footer[12]; got != sstableVersion {
+		return nil, fmt.Errorf("sstable: unsupported version %d", got)
+	}
+
+	indexOffset := binary.LittleEndian.Uint64(footer)
+	if indexOffset > uint64(footerOffset) {
+		return nil, fmt.Errorf("sstable: invalid index offset %d", indexOffset)
+	}
+
+	indexSize := int(footerOffset - int64(indexOffset))
+	indexData := make([]byte, indexSize)
+	if indexSize > 0 {
+		if _, err := file.ReadAt(indexData, int64(indexOffset)); err != nil && err != io.EOF {
+			return nil, err
+		}
+	}
+
+	sst := &sstable{f: file}
+	sst.idx.decodeFullRange(indexData)
+	cleanup = false
+	return sst, nil
+}
+
 type sstable struct {
 	idx tableIndex
 	f   *os.File
+}
+
+func (s *sstable) get(key []byte) ([]byte, error) {
+	ra := s.idx.findDataRange(key)
+	if ra == nil {
+		return nil, nil
+	}
+
+	block := make([]byte, ra.length)
+	if _, err := s.f.ReadAt(block, int64(ra.offset)); err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	ptr := 0
+	for ptr < len(block) {
+		if len(block)-ptr < entryMetaSize {
+			return nil, fmt.Errorf("sstable: truncated entry header")
+		}
+
+		klen := int(binary.LittleEndian.Uint16(block[ptr:]))
+		vlen := int(binary.LittleEndian.Uint32(block[ptr+2:]))
+		ptr += entryMetaSize
+		if ptr+klen+vlen > len(block) {
+			return nil, fmt.Errorf("sstable: truncated entry body")
+		}
+
+		entryKey := block[ptr : ptr+klen]
+		ptr += klen
+		value := block[ptr : ptr+vlen]
+		ptr += vlen
+
+		cmp := bytes.Compare(entryKey, key)
+		if cmp == 0 {
+			return value, nil
+		}
+		if cmp > 0 {
+			return nil, nil
+		}
+	}
+
+	return nil, nil
 }
 
 func (s *sstable) close() error {

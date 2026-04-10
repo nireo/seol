@@ -200,3 +200,60 @@ func TestFlushSkiplistRejectsOversizedEntry(t *testing.T) {
 		t.Fatalf("expected cleanup after failure, found %d files", len(entries))
 	}
 }
+
+func TestOpenSSTableGet(t *testing.T) {
+	dir := t.TempDir()
+	s := newSkiplist(1 << 20)
+
+	expected := map[string][]byte{
+		"a": bytes.Repeat([]byte{'A'}, 1400),
+		"b": bytes.Repeat([]byte{'B'}, 1400),
+		"c": bytes.Repeat([]byte{'C'}, 1400),
+		"d": bytes.Repeat([]byte{'D'}, 1400),
+		"e": bytes.Repeat([]byte{'E'}, 1400),
+	}
+	for key, value := range expected {
+		s.put([]byte(key), value)
+	}
+
+	flushed, err := flushSkiplist(dir, s)
+	if err != nil {
+		t.Fatalf("flushSkiplist: %v", err)
+	}
+	path := flushed.f.Name()
+	if err := flushed.close(); err != nil {
+		t.Fatalf("close flushed table: %v", err)
+	}
+
+	loaded, err := openSSTable(path)
+	if err != nil {
+		t.Fatalf("openSSTable: %v", err)
+	}
+	defer func() { _ = loaded.close() }()
+
+	for key, want := range expected {
+		got, err := loaded.get([]byte(key))
+		if err != nil {
+			t.Fatalf("get %q: %v", key, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("get %q: got %d bytes, want %d", key, len(got), len(want))
+		}
+	}
+
+	got, err := loaded.get([]byte("aa"))
+	if err != nil {
+		t.Fatalf("get aa: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("get aa: got %q, want nil", got)
+	}
+
+	got, err = loaded.get([]byte("z"))
+	if err != nil {
+		t.Fatalf("get z: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("get z: got %q, want nil", got)
+	}
+}
