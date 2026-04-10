@@ -1,6 +1,8 @@
 package seol
 
 import (
+	"encoding/binary"
+	"fmt"
 	"math"
 	"math/bits"
 
@@ -10,6 +12,9 @@ import (
 const (
 	derivedHashMultiplier uint64 = 0x517cc1b727220a95
 	wordBits              int    = 64
+	bloomMagic            uint32 = 0xB100F11E
+	bloomVersion          byte   = 1
+	bloomHeaderSize       int    = 4 + 1 + 8 + 4 + 8
 )
 
 // Filter is a non-concurrent Bloom filter backed by 64-bit words.
@@ -140,6 +145,73 @@ func (f *Filter) ContainsHash(hash uint64) bool {
 // Reset clears all bits in the filter.
 func (f *Filter) Reset() {
 	clear(f.words)
+}
+
+// MarshalBinary encodes the filter into a compact binary format.
+func (f *Filter) MarshalBinary() ([]byte, error) {
+	buf := make([]byte, bloomHeaderSize+len(f.words)*8)
+	binary.LittleEndian.PutUint32(buf, bloomMagic)
+	buf[4] = bloomVersion
+	binary.LittleEndian.PutUint64(buf[5:], f.numBits)
+	binary.LittleEndian.PutUint32(buf[13:], f.numHashes)
+	binary.LittleEndian.PutUint64(buf[17:], f.seed)
+
+	ptr := bloomHeaderSize
+	for _, word := range f.words {
+		binary.LittleEndian.PutUint64(buf[ptr:], word)
+		ptr += 8
+	}
+
+	return buf, nil
+}
+
+// UnmarshalBinary decodes a filter written by MarshalBinary.
+func (f *Filter) UnmarshalBinary(data []byte) error {
+	if len(data) < bloomHeaderSize {
+		return fmt.Errorf("bloom: data too short")
+	}
+	if got := binary.LittleEndian.Uint32(data); got != bloomMagic {
+		return fmt.Errorf("bloom: invalid magic %#x", got)
+	}
+	if got := data[4]; got != bloomVersion {
+		return fmt.Errorf("bloom: unsupported version %d", got)
+	}
+
+	numBits := binary.LittleEndian.Uint64(data[5:])
+	if numBits == 0 || numBits%uint64(wordBits) != 0 {
+		return fmt.Errorf("bloom: invalid bit count %d", numBits)
+	}
+
+	numHashes := binary.LittleEndian.Uint32(data[13:])
+	if numHashes == 0 {
+		return fmt.Errorf("bloom: invalid hash count %d", numHashes)
+	}
+
+	wordCount := int(numBits / uint64(wordBits))
+	if len(data) != bloomHeaderSize+wordCount*8 {
+		return fmt.Errorf("bloom: invalid data length %d", len(data))
+	}
+
+	words := make([]uint64, wordCount)
+	ptr := bloomHeaderSize
+	for i := range words {
+		words[i] = binary.LittleEndian.Uint64(data[ptr:])
+		ptr += 8
+	}
+
+	f.words = words
+	f.numBits = numBits
+	f.numHashes = numHashes
+	f.seed = binary.LittleEndian.Uint64(data[17:])
+	return nil
+}
+
+func ReadFilter(data []byte) (*Filter, error) {
+	var f Filter
+	if err := f.UnmarshalBinary(data); err != nil {
+		return nil, err
+	}
+	return &f, nil
 }
 
 func (f *Filter) check(idx uint64) bool {

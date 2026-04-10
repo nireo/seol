@@ -1,6 +1,8 @@
 package seol
 
 import (
+	"bytes"
+	"encoding/binary"
 	"strconv"
 	"testing"
 
@@ -123,6 +125,84 @@ func TestFalsePositiveRateIsReasonable(t *testing.T) {
 	rate := float64(falsePositives) / float64(samples)
 	if rate > targetFP*1.5 {
 		t.Fatalf("false positive rate too high: got %.4f want <= %.4f", rate, targetFP*1.5)
+	}
+}
+
+func TestMarshalBinaryRoundTrip(t *testing.T) {
+	original := NewForSeeded(2000, 0.01, 42)
+	for i := range 2000 {
+		original.AddString("member-" + strconv.Itoa(i))
+	}
+
+	data, err := original.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	if len(data) != bloomHeaderSize+len(original.words)*8 {
+		t.Fatalf("encoded length: got %d, want %d", len(data), bloomHeaderSize+len(original.words)*8)
+	}
+	if got := binary.LittleEndian.Uint32(data); got != bloomMagic {
+		t.Fatalf("magic: got %#x, want %#x", got, bloomMagic)
+	}
+	if got := data[4]; got != bloomVersion {
+		t.Fatalf("version: got %d, want %d", got, bloomVersion)
+	}
+
+	decoded, err := ReadFilter(data)
+	if err != nil {
+		t.Fatalf("ReadFilter: %v", err)
+	}
+	if decoded.numBits != original.numBits {
+		t.Fatalf("numBits: got %d, want %d", decoded.numBits, original.numBits)
+	}
+	if decoded.numHashes != original.numHashes {
+		t.Fatalf("numHashes: got %d, want %d", decoded.numHashes, original.numHashes)
+	}
+	if decoded.seed != original.seed {
+		t.Fatalf("seed: got %d, want %d", decoded.seed, original.seed)
+	}
+	if !equalWords(decoded.words, original.words) {
+		t.Fatalf("decoded words differ from original")
+	}
+
+	for i := range 2000 {
+		value := "member-" + strconv.Itoa(i)
+		if !decoded.ContainsString(value) {
+			t.Fatalf("decoded filter missing %q", value)
+		}
+	}
+	if decoded.ContainsString("definitely-not-present") && !original.ContainsString("definitely-not-present") {
+		t.Fatalf("decoded filter diverged from original")
+	}
+}
+
+func TestUnmarshalBinaryRejectsInvalidData(t *testing.T) {
+	if _, err := ReadFilter([]byte("short")); err == nil {
+		t.Fatalf("expected short data error")
+	}
+
+	valid := NewSeeded(1024, 4, 7)
+	valid.AddString("hello")
+	data, err := valid.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	badMagic := bytes.Clone(data)
+	binary.LittleEndian.PutUint32(badMagic, 0)
+	if _, err := ReadFilter(badMagic); err == nil {
+		t.Fatalf("expected bad magic error")
+	}
+
+	badVersion := bytes.Clone(data)
+	badVersion[4]++
+	if _, err := ReadFilter(badVersion); err == nil {
+		t.Fatalf("expected bad version error")
+	}
+
+	badLength := data[:len(data)-1]
+	if _, err := ReadFilter(badLength); err == nil {
+		t.Fatalf("expected bad length error")
 	}
 }
 
