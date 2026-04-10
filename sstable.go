@@ -19,12 +19,13 @@ import (
 // - reuse read buffers to avoid too many allocations
 
 const (
-	sstableBlockSize  int    = 4 * 1024 // 4kb
-	sstableMagic      uint32 = 0xFF12FF45
-	sstableVersion    byte   = 1
-	sstableFooterSize int    = 8 + 4 + 1 // index offset + magic + version
-	entryMetaSize     int    = 2 + 4     // uint16 (keylen) + uint32 (vallen)
-	dataRangeMetaSize int    = 2 + 8 + 4 // uint16 (keylen) + uint64 (offset) + uint32 (datablock length)
+	sstableBlockSize       int    = 4 * 1024 // 4kb
+	sstableMagic           uint32 = 0xFF12FF45
+	sstableVersion         byte   = 2
+	sstableFooterSize      int    = 8 + 4 + 1 // index offset + magic + version
+	entryMetaSize          int    = 2 + 4     // uint16 (keylen) + uint32 (vallen)
+	dataRangeMetaSize      int    = 2 + 8 + 4 // uint16 (keylen) + uint64 (offset) + uint32 (datablock length)
+	bloomFalsePositiveRate        = 0.01
 )
 
 type dataRange struct {
@@ -138,11 +139,27 @@ func flushSkiplist(baseDir string, sk *skiplist) (*sstable, error) {
 		f:   file,
 	}
 
+	entryCount := 0
+	countIt := sk.newIterator()
+	defer countIt.close()
+	countIt.rewind()
+	for countIt.valid() {
+		entryCount++
+		countIt.next()
+	}
+
+	bloom := NewFor(entryCount, bloomFalsePositiveRate)
+	bloomSize := bloomHeaderSize + len(bloom.words)*8
+	if _, err := file.Seek(int64(bloomSize), io.SeekStart); err != nil {
+		return nil, err
+	}
+	sst.filter = bloom
+
 	it := sk.newIterator()
 	defer it.close()
 	it.rewind()
 	bw := bufio.NewWriter(file)
-	offset := uint64(0)
+	offset := uint64(bloomSize)
 	block := make([]byte, 0, sstableBlockSize)
 	currentRange := dataRange{}
 
@@ -166,6 +183,7 @@ func flushSkiplist(baseDir string, sk *skiplist) (*sstable, error) {
 	for it.valid() {
 		key := it.key()
 		value := it.value()
+		bloom.Add(key)
 		entrySize := entryMetaSize + len(key) + len(value)
 		if entrySize > sstableBlockSize {
 			return nil, fmt.Errorf("sstable: entry for key %q exceeds block size", key)
@@ -213,6 +231,14 @@ func flushSkiplist(baseDir string, sk *skiplist) (*sstable, error) {
 		return nil, err
 	}
 
+	bloomData, err := bloom.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.WriteAt(bloomData, 0); err != nil {
+		return nil, err
+	}
+
 	cleanup = false
 
 	return sst, nil
@@ -238,6 +264,35 @@ func openSSTable(path string) (*sstable, error) {
 		return nil, fmt.Errorf("sstable: file too small")
 	}
 
+	bloomHeader := make([]byte, bloomHeaderSize)
+	if _, err := file.ReadAt(bloomHeader, 0); err != nil {
+		return nil, err
+	}
+	if got := binary.LittleEndian.Uint32(bloomHeader); got != bloomMagic {
+		return nil, fmt.Errorf("sstable: invalid bloom magic %#x", got)
+	}
+	if got := bloomHeader[4]; got != bloomVersion {
+		return nil, fmt.Errorf("sstable: unsupported bloom version %d", got)
+	}
+
+	bloomBits := binary.LittleEndian.Uint64(bloomHeader[5:])
+	if bloomBits == 0 || bloomBits%uint64(wordBits) != 0 {
+		return nil, fmt.Errorf("sstable: invalid bloom bit count %d", bloomBits)
+	}
+	bloomSize := bloomHeaderSize + int(bloomBits/uint64(wordBits))*8
+	if stat.Size() < int64(bloomSize+sstableFooterSize) {
+		return nil, fmt.Errorf("sstable: file too small for bloom filter")
+	}
+
+	bloomData := make([]byte, bloomSize)
+	if _, err := file.ReadAt(bloomData, 0); err != nil {
+		return nil, err
+	}
+	bloom, err := ReadFilter(bloomData)
+	if err != nil {
+		return nil, err
+	}
+
 	footer := make([]byte, sstableFooterSize)
 	footerOffset := stat.Size() - int64(sstableFooterSize)
 	if _, err := file.ReadAt(footer, footerOffset); err != nil {
@@ -252,7 +307,7 @@ func openSSTable(path string) (*sstable, error) {
 	}
 
 	indexOffset := binary.LittleEndian.Uint64(footer)
-	if indexOffset > uint64(footerOffset) {
+	if indexOffset < uint64(bloomSize) || indexOffset > uint64(footerOffset) {
 		return nil, fmt.Errorf("sstable: invalid index offset %d", indexOffset)
 	}
 
@@ -264,18 +319,23 @@ func openSSTable(path string) (*sstable, error) {
 		}
 	}
 
-	sst := &sstable{f: file}
+	sst := &sstable{f: file, filter: bloom}
 	sst.idx.decodeFullRange(indexData)
 	cleanup = false
 	return sst, nil
 }
 
 type sstable struct {
-	idx tableIndex
-	f   *os.File
+	idx    tableIndex
+	filter *Filter
+	f      *os.File
 }
 
 func (s *sstable) get(key []byte) ([]byte, error) {
+	if s.filter != nil && !s.filter.Contains(key) {
+		return nil, nil
+	}
+
 	ra := s.idx.findDataRange(key)
 	if ra == nil {
 		return nil, nil

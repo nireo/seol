@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"strconv"
 	"testing"
 )
 
@@ -77,6 +78,20 @@ func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 		t.Fatalf("sstable too small: got %d bytes", len(data))
 	}
 
+	bloomSize := bloomHeaderSize + len(sst.filter.words)*8
+	storedBloom, err := ReadFilter(data[:bloomSize])
+	if err != nil {
+		t.Fatalf("ReadFilter: %v", err)
+	}
+	if !equalWords(storedBloom.words, sst.filter.words) {
+		t.Fatalf("stored bloom differs from in-memory bloom")
+	}
+	for _, key := range []string{"a", "b", "c", "d", "e"} {
+		if !storedBloom.ContainsString(key) {
+			t.Fatalf("stored bloom missing %q", key)
+		}
+	}
+
 	footerOffset := len(data) - sstableFooterSize
 	indexOffset := binary.LittleEndian.Uint64(data[footerOffset:])
 	if got := binary.LittleEndian.Uint32(data[footerOffset+8:]); got != sstableMagic {
@@ -122,7 +137,7 @@ func TestFlushSkiplistWritesBlocksIndexAndFooter(t *testing.T) {
 		{key: "e", value: bytes.Repeat([]byte{'E'}, 1400)},
 	}
 
-	dataEnd := uint64(0)
+	dataEnd := uint64(bloomSize)
 	entryIdx := 0
 	for i, ra := range decoded.ranges {
 		if ra.length == 0 || int(ra.length) > sstableBlockSize {
@@ -229,7 +244,9 @@ func TestOpenSSTableGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSSTable: %v", err)
 	}
-	defer func() { _ = loaded.close() }()
+	if loaded.filter == nil {
+		t.Fatalf("expected bloom filter to be loaded")
+	}
 
 	for key, want := range expected {
 		got, err := loaded.get([]byte(key))
@@ -255,5 +272,29 @@ func TestOpenSSTableGet(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("get z: got %q, want nil", got)
+	}
+
+	missing := ""
+	for i := 0; i < 1024; i++ {
+		candidate := "missing-" + strconv.Itoa(i)
+		if !loaded.filter.ContainsString(candidate) {
+			missing = candidate
+			break
+		}
+	}
+	if missing == "" {
+		t.Fatalf("failed to find bloom-negative key")
+	}
+
+	if err := loaded.close(); err != nil {
+		t.Fatalf("close loaded table: %v", err)
+	}
+
+	got, err = loaded.get([]byte(missing))
+	if err != nil {
+		t.Fatalf("get %q after close: %v", missing, err)
+	}
+	if got != nil {
+		t.Fatalf("get %q after close: got %q, want nil", missing, got)
 	}
 }
