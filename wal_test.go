@@ -3,12 +3,14 @@ package seol
 import (
 	"bytes"
 	"os"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestWALAppendReplayRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	w, err := createWAL(dir)
+	w, err := createWAL(dir, 0)
 	if err != nil {
 		t.Fatalf("createWAL: %v", err)
 	}
@@ -54,7 +56,7 @@ func TestWALAppendReplayRoundTrip(t *testing.T) {
 
 func TestWALReplayIgnoresTruncatedTail(t *testing.T) {
 	dir := t.TempDir()
-	w, err := createWAL(dir)
+	w, err := createWAL(dir, 0)
 	if err != nil {
 		t.Fatalf("createWAL: %v", err)
 	}
@@ -86,5 +88,37 @@ func TestWALReplayIgnoresTruncatedTail(t *testing.T) {
 
 	if got, want := keys, []string{"alpha"}; len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("replayed keys: got %v, want %v", got, want)
+	}
+}
+
+func TestWALBatchSyncsSharedDurability(t *testing.T) {
+	dir := t.TempDir()
+	w, err := createWAL(dir, 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("createWAL: %v", err)
+	}
+	defer func() { _ = w.close() }()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := w.appendPut([]byte{byte('a' + i)}, bytes.Repeat([]byte{byte('0' + i)}, 32)); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("appendPut: %v", err)
+		}
+	}
+
+	if got := w.syncCountValue(); got == 0 || got >= 8 {
+		t.Fatalf("sync count: got %d, want between 1 and 7", got)
 	}
 }

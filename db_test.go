@@ -10,7 +10,7 @@ import (
 
 func TestDBOpenCloseReload(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(dir, 1<<10, flushSkiplist)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 10}, flushSkiplist)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestDBOpenCloseReload(t *testing.T) {
 
 func TestDBRecoversFromWAL(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(dir, 1<<20, flushSkiplist)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, flushSkiplist)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 		return flushSkiplist(baseDir, sk)
 	}
 
-	db, err := openDB(dir, 1<<10, flushFn)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 10}, flushFn)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 
 func TestDBReadsNewestSSTableFirst(t *testing.T) {
 	dir := t.TempDir()
-	db, err := openDB(dir, 128, flushSkiplist)
+	db, err := openDB(dir, Options{MemtableMaxBytes: 128}, flushSkiplist)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}

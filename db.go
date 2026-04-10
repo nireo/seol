@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -20,9 +21,15 @@ type immutableMemtable struct {
 	walPaths []string
 }
 
+type Options struct {
+	MemtableMaxBytes int64
+	WALSyncInterval  time.Duration
+}
+
 type DB struct {
 	dir              string
 	memtableMaxBytes int64
+	walSyncInterval  time.Duration
 	memtable         *skiplist
 	activeWal        *wal
 	currentWalPaths  []string
@@ -38,12 +45,16 @@ type DB struct {
 }
 
 func Open(dir string) (*DB, error) {
-	return openDB(dir, defaultMemtableMaxBytes, flushSkiplist)
+	return OpenWithOptions(dir, Options{})
 }
 
-func openDB(dir string, memtableMaxBytes int64, flushFn func(baseDir string, sk *skiplist) (*sstable, error)) (*DB, error) {
-	if memtableMaxBytes <= 0 {
-		memtableMaxBytes = defaultMemtableMaxBytes
+func OpenWithOptions(dir string, opts Options) (*DB, error) {
+	return openDB(dir, opts, flushSkiplist)
+}
+
+func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist) (*sstable, error)) (*DB, error) {
+	if opts.MemtableMaxBytes <= 0 {
+		opts.MemtableMaxBytes = defaultMemtableMaxBytes
 	}
 	if flushFn == nil {
 		flushFn = flushSkiplist
@@ -92,7 +103,7 @@ func openDB(dir string, memtableMaxBytes int64, flushFn func(baseDir string, sk 
 		sstables = append(sstables, sst)
 	}
 
-	memtable := newSkiplist(memtableArenaSize(memtableMaxBytes))
+	memtable := newSkiplist(memtableArenaSize(opts.MemtableMaxBytes))
 	for _, path := range walPaths {
 		if err := replayWAL(path, func(key, value []byte) error {
 			memtable.put(key, value)
@@ -105,7 +116,7 @@ func openDB(dir string, memtableMaxBytes int64, flushFn func(baseDir string, sk 
 		}
 	}
 
-	activeWal, err := createWAL(dir)
+	activeWal, err := createWAL(dir, opts.WALSyncInterval)
 	if err != nil {
 		for _, opened := range sstables {
 			_ = opened.close()
@@ -117,7 +128,8 @@ func openDB(dir string, memtableMaxBytes int64, flushFn func(baseDir string, sk 
 	currentWalPaths = append(currentWalPaths, activeWal.path)
 	db := &DB{
 		dir:              dir,
-		memtableMaxBytes: memtableMaxBytes,
+		memtableMaxBytes: opts.MemtableMaxBytes,
+		walSyncInterval:  opts.WALSyncInterval,
 		memtable:         memtable,
 		activeWal:        activeWal,
 		currentWalPaths:  currentWalPaths,
@@ -161,7 +173,7 @@ func (db *DB) Put(key, value []byte) error {
 		return nil
 	}
 
-	nextWal, err := createWAL(db.dir)
+	nextWal, err := createWAL(db.dir, db.walSyncInterval)
 	if err != nil {
 		db.mu.Unlock()
 		return fmt.Errorf("seol: rotate wal: %w", err)
