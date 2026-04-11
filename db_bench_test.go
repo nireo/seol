@@ -185,6 +185,7 @@ func BenchmarkDBWriteFootprint(b *testing.B) {
 		totalUsage.total += usage.total
 		totalUsage.wal += usage.wal
 		totalUsage.sst += usage.sst
+		totalUsage.vlog += usage.vlog
 
 		if err := os.RemoveAll(iterDir); err != nil {
 			b.Fatalf("remove iteration dir: %v", err)
@@ -195,6 +196,7 @@ func BenchmarkDBWriteFootprint(b *testing.B) {
 	b.ReportMetric(float64(totalUsage.total)/float64(b.N), "disk-B/op")
 	b.ReportMetric(float64(totalUsage.sst)/float64(b.N), "sst-B/op")
 	b.ReportMetric(float64(totalUsage.wal)/float64(b.N), "wal-B/op")
+	b.ReportMetric(float64(totalUsage.vlog)/float64(b.N), "vlog-B/op")
 	b.ReportMetric(float64(totalUsage.total)/float64(b.N)/float64(logicalBytes), "disk/logical")
 }
 
@@ -202,6 +204,7 @@ type benchmarkFileUsage struct {
 	total int64
 	wal   int64
 	sst   int64
+	vlog  int64
 }
 
 func benchmarkResetDB(b *testing.B, dir string, opts Options) *DB {
@@ -244,6 +247,11 @@ func benchmarkStopDBWithoutFlush(b *testing.B, db *DB) {
 	}
 	close(db.flushCh)
 	db.wg.Wait()
+	if db.valueLog != nil {
+		if err := db.valueLog.Close(); err != nil {
+			b.Fatalf("close value log: %v", err)
+		}
+	}
 
 	db.mu.RLock()
 	sstables := append([]*sstable.Table(nil), db.sstables...)
@@ -335,6 +343,8 @@ func benchmarkDirUsage(dir string) (benchmarkFileUsage, error) {
 			usage.wal += size
 		case ".sst":
 			usage.sst += size
+		case ".vlog":
+			usage.vlog += size
 		}
 	}
 

@@ -96,6 +96,107 @@ func TestDBRecoversFromWAL(t *testing.T) {
 	}
 }
 
+func TestDBStoresValueRefsInMemtable(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 32}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	key := []byte("alpha")
+	value := bytes.Repeat([]byte{'x'}, 128)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+
+	stored := db.memtable.Get(key)
+	if bytes.Equal(stored, value) {
+		t.Fatalf("memtable stored inline value, expected encoded reference")
+	}
+	if _, ok, err := decodeValueRef(stored); err != nil || !ok {
+		if err != nil {
+			t.Fatalf("decodeValueRef: %v", err)
+		}
+		t.Fatalf("memtable value is not an encoded value reference")
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("get alpha: %v", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("get alpha: got %d bytes, want %d", len(got), len(value))
+	}
+}
+
+func TestDBStoresSmallValuesInline(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 64}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	key := []byte("alpha")
+	value := []byte("small-value")
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+
+	stored := db.memtable.Get(key)
+	if !bytes.Equal(stored, value) {
+		t.Fatalf("memtable stored value: got %q, want %q", stored, value)
+	}
+	if _, ok, err := decodeValueRef(stored); err != nil || ok {
+		if err != nil {
+			t.Fatalf("decodeValueRef: %v", err)
+		}
+		t.Fatalf("small value should stay inline")
+	}
+}
+
+func TestDBReplaysSmallValuesInlineFromWAL(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 64}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	key := []byte("alpha")
+	value := []byte("small-value")
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+
+	stopDBWithoutFlush(t, db)
+
+	reopened, err := OpenWithOptions(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 64})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	stored := reopened.memtable.Get(key)
+	if !bytes.Equal(stored, value) {
+		t.Fatalf("replayed memtable stored value: got %q, want %q", stored, value)
+	}
+	if _, ok, err := decodeValueRef(stored); err != nil || ok {
+		if err != nil {
+			t.Fatalf("decodeValueRef replayed: %v", err)
+		}
+		t.Fatalf("replayed small value should stay inline")
+	}
+
+	got, err := reopened.Get(key)
+	if err != nil {
+		t.Fatalf("get alpha after reopen: %v", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("get alpha after reopen: got %q, want %q", got, value)
+	}
+}
+
 func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 	dir := t.TempDir()
 	started := make(chan struct{}, 1)
@@ -238,6 +339,11 @@ func stopDBWithoutFlush(t *testing.T, db *DB) {
 	}
 	close(db.flushCh)
 	db.wg.Wait()
+	if db.valueLog != nil {
+		if err := db.valueLog.Close(); err != nil {
+			t.Fatalf("close value log: %v", err)
+		}
+	}
 
 	db.mu.RLock()
 	sstables := append([]*sstable.Table(nil), db.sstables...)

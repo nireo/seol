@@ -301,8 +301,14 @@ func (l *Log) Close() error {
 		l.mu.Unlock()
 		return nil
 	}
+	var err error
+	if l.active != nil && l.active.f != nil {
+		err = l.active.f.Sync()
+	}
 	l.closed = true
-	err := l.closeFiles()
+	if closeErr := l.closeFiles(); err == nil {
+		err = closeErr
+	}
 	l.mu.Unlock()
 
 	return err
@@ -328,6 +334,12 @@ func (l *Log) closeFiles() error {
 }
 
 func (l *Log) rotateSegmentLocked(lastID uint64) error {
+	if l.active != nil && l.active.f != nil {
+		if err := l.active.f.Sync(); err != nil {
+			return err
+		}
+	}
+
 	id := nextSegmentID(lastID)
 	path := filepath.Join(l.dir, segmentName(id))
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
