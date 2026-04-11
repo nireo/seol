@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,15 +26,17 @@ func BenchmarkDBPut(b *testing.B) {
 	cases := []struct {
 		name         string
 		syncInterval time.Duration
+		asyncWrites  bool
 	}{
 		{name: "sync_immediate", syncInterval: 0},
 		{name: "sync_batched_5ms", syncInterval: 5 * time.Millisecond},
+		{name: "async_batched_5ms", syncInterval: 5 * time.Millisecond, asyncWrites: true},
 	}
 
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
 			dir := b.TempDir()
-			opts := Options{MemtableMaxBytes: benchmarkDBMemtableBytes, WALSyncInterval: tc.syncInterval}
+			opts := Options{MemtableMaxBytes: benchmarkDBMemtableBytes, WALSyncInterval: tc.syncInterval, AsyncWrites: tc.asyncWrites}
 			db := benchmarkResetDB(b, dir, opts)
 			defer func() {
 				if db != nil {
@@ -56,6 +59,41 @@ func BenchmarkDBPut(b *testing.B) {
 					b.Fatalf("put: %v", err)
 				}
 			}
+		})
+	}
+}
+
+func BenchmarkDBPutParallel(b *testing.B) {
+	keys, values, _ := benchmarkDBRecords(1<<12, benchmarkDBKeySize, benchmarkDBValueSize)
+	cases := []struct {
+		name         string
+		syncInterval time.Duration
+		asyncWrites  bool
+	}{
+		{name: "sync_immediate", syncInterval: 0},
+		{name: "sync_batched_5ms", syncInterval: 5 * time.Millisecond},
+		{name: "async_batched_5ms", syncInterval: 5 * time.Millisecond, asyncWrites: true},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			dir := b.TempDir()
+			opts := Options{MemtableMaxBytes: benchmarkDBMemtableBytes, WALSyncInterval: tc.syncInterval, AsyncWrites: tc.asyncWrites}
+			db := benchmarkResetDB(b, dir, opts)
+			defer func() { _ = db.Close() }()
+
+			var idx atomic.Uint64
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					i := int(idx.Add(1) - 1)
+					if err := db.Put(keys[i%len(keys)], values[i%len(values)]); err != nil {
+						b.Errorf("put: %v", err)
+						return
+					}
+				}
+			})
 		})
 	}
 }
@@ -236,6 +274,14 @@ func benchmarkStopDBWithoutFlush(b *testing.B, db *DB) {
 		return
 	}
 	db.closed = true
+	db.mu.Unlock()
+
+	db.submitMu.Lock()
+	db.writeCh <- nil
+	db.submitMu.Unlock()
+	db.writeWg.Wait()
+
+	db.mu.Lock()
 	activeWal := db.activeWal
 	db.activeWal = nil
 	db.mu.Unlock()
@@ -246,7 +292,7 @@ func benchmarkStopDBWithoutFlush(b *testing.B, db *DB) {
 		}
 	}
 	close(db.flushCh)
-	db.wg.Wait()
+	db.flushWg.Wait()
 	if db.valueLog != nil {
 		if err := db.valueLog.Close(); err != nil {
 			b.Fatalf("close value log: %v", err)

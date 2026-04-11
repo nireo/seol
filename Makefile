@@ -1,4 +1,4 @@
-.PHONY: test bench bench-db bench-db-baseline bench-db-compare bench-db-latest bench-compare
+.PHONY: test bench bench-db bench-db-baseline bench-db-compare bench-db-latest bench-db-leveldb bench-db-leveldb-baseline bench-db-leveldb-compare bench-db-leveldb-latest bench-compare
 
 BENCH ?= .
 BENCHTIME ?= 250ms
@@ -22,6 +22,18 @@ bench-db-compare:
 
 bench-db-latest:
 	./scripts/bench-db.sh latest
+
+bench-db-leveldb:
+	PATTERN='^BenchmarkCompare' BENCHTIME=$(BENCHTIME) COUNT=$(COUNT) ./scripts/bench-db-leveldb.sh run "$(NAME)"
+
+bench-db-leveldb-baseline:
+	PATTERN='^BenchmarkCompare' BENCHTIME=$(BENCHTIME) COUNT=$(COUNT) ./scripts/bench-db-leveldb.sh baseline "$(NAME)"
+
+bench-db-leveldb-compare:
+	PATTERN='^BenchmarkCompare' BENCHTIME=$(BENCHTIME) COUNT=$(COUNT) ./scripts/bench-db-leveldb.sh compare "$(NAME)"
+
+bench-db-leveldb-latest:
+	./scripts/bench-db-leveldb.sh latest
 
 bench-compare:
 	./scripts/bench-compare.sh $(OLD) $(NEW)

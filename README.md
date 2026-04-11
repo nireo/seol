@@ -6,4 +6,8 @@ A fast embeddable Go LSMT key-value store. Uses many concepts from the WiscKey p
 
 ### Bloom Filter Comparison
 
-Compared to the bits-and-blooms implementation we can see.
+Current comparison results are in `bloom/BENCHMARKS.md`.
+
+### DB Engine Comparison
+
+`benchmarks/dbcompare` contains a separate benchmark module for comparing `seol` against `goleveldb` over single-threaded and multi-threaded `Put`, `Get`, and `Open` workloads.

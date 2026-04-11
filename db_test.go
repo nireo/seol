@@ -197,6 +197,46 @@ func TestDBReplaysSmallValuesInlineFromWAL(t *testing.T) {
 	}
 }
 
+func TestDBAsyncWritesReadYourWriteAndPersistOnClose(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, WALSyncInterval: 50 * time.Millisecond, AsyncWrites: true}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	key := []byte("alpha")
+	value := bytes.Repeat([]byte{'v'}, 128)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("get alpha before close: %v", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("get alpha before close: got %d bytes, want %d", len(got), len(value))
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	reopened, err := OpenWithOptions(dir, Options{WALSyncInterval: 50 * time.Millisecond, AsyncWrites: true})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	got, err = reopened.Get(key)
+	if err != nil {
+		t.Fatalf("get alpha after reopen: %v", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("get alpha after reopen: got %d bytes, want %d", len(got), len(value))
+	}
+}
+
 func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 	dir := t.TempDir()
 	started := make(chan struct{}, 1)
@@ -328,6 +368,14 @@ func stopDBWithoutFlush(t *testing.T, db *DB) {
 		return
 	}
 	db.closed = true
+	db.mu.Unlock()
+
+	db.submitMu.Lock()
+	db.writeCh <- nil
+	db.submitMu.Unlock()
+	db.writeWg.Wait()
+
+	db.mu.Lock()
 	activeWal := db.activeWal
 	db.activeWal = nil
 	db.mu.Unlock()
@@ -338,7 +386,7 @@ func stopDBWithoutFlush(t *testing.T, db *DB) {
 		}
 	}
 	close(db.flushCh)
-	db.wg.Wait()
+	db.flushWg.Wait()
 	if db.valueLog != nil {
 		if err := db.valueLog.Close(); err != nil {
 			t.Fatalf("close value log: %v", err)

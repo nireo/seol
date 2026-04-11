@@ -27,4 +27,4 @@ Median of 5 runs. All benchmarks were `0 B/op` and `0 allocs/op` for both implem
 | `Add([]byte)` | `7.429 ns/op` | `32.59 ns/op` | `4.39x` |
 | `Contains([]byte)` | `6.369 ns/op` | `22.17 ns/op` | `3.48x` |
 
-The comparison benchmarks live in `bloom/bloom_compare_bench_test.go`.
+These numbers were captured from a one-off local comparison run and are kept here as reference.

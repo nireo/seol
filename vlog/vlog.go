@@ -228,11 +228,61 @@ func (l *Log) Append(key, value []byte) (ValueRef, error) {
 }
 
 func (l *Log) Read(ref ValueRef) ([]byte, error) {
-	record, err := l.ReadRecord(ref)
-	if err != nil {
+	return l.ReadValue(ref)
+}
+
+func (l *Log) ReadValue(ref ValueRef) ([]byte, error) {
+	l.mu.RLock()
+	if l.closed {
+		l.mu.RUnlock()
+		return nil, errors.New("vlog: closed")
+	}
+	file := l.files[ref.SegmentID]
+	l.mu.RUnlock()
+	if file == nil {
+		return nil, fmt.Errorf("vlog: unknown segment %d", ref.SegmentID)
+	}
+
+	var header [recordHeaderSize]byte
+	if _, err := file.ReadAt(header[:], int64(ref.Offset)); err != nil {
 		return nil, err
 	}
-	return record.Value, nil
+
+	keyLen := binary.LittleEndian.Uint32(header[4:])
+	valueLen := binary.LittleEndian.Uint32(header[8:])
+	if valueLen != ref.ValueLen {
+		return nil, fmt.Errorf("vlog: value length mismatch for segment %d offset %d", ref.SegmentID, ref.Offset)
+	}
+
+	offset := int64(ref.Offset) + recordHeaderSize
+	checksum := crc32.Update(0, crc32.IEEETable, header[4:])
+	var scratch [256]byte
+	for remaining := int(keyLen); remaining > 0; {
+		chunk := len(scratch)
+		if remaining < chunk {
+			chunk = remaining
+		}
+		if _, err := file.ReadAt(scratch[:chunk], offset); err != nil {
+			return nil, err
+		}
+		checksum = crc32.Update(checksum, crc32.IEEETable, scratch[:chunk])
+		offset += int64(chunk)
+		remaining -= chunk
+	}
+
+	value := make([]byte, int(valueLen))
+	if _, err := file.ReadAt(value, offset); err != nil {
+		return nil, err
+	}
+	checksum = crc32.Update(checksum, crc32.IEEETable, value)
+	if checksum != binary.LittleEndian.Uint32(header[:]) {
+		return nil, fmt.Errorf("vlog: checksum mismatch for segment %d offset %d", ref.SegmentID, ref.Offset)
+	}
+	if crc32.ChecksumIEEE(value) != ref.Checksum {
+		return nil, fmt.Errorf("vlog: value checksum mismatch for segment %d offset %d", ref.SegmentID, ref.Offset)
+	}
+
+	return value, nil
 }
 
 func (l *Log) ReadRecord(ref ValueRef) (Record, error) {

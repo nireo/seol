@@ -15,12 +15,13 @@ import (
 
 const walRecordHeaderSize = 4 + 4 + 4 // checksum + keylen + vallen
 
+const walBufferedWriterSize = 64 << 10
+
 type wal struct {
 	path         string
 	f            *os.File
 	bw           *bufio.Writer
 	scratch      []byte
-	hasData      bool
 	syncInterval time.Duration
 	wakeCh       chan struct{}
 	closeCh      chan struct{}
@@ -33,6 +34,11 @@ type wal struct {
 	syncErr   error
 	closed    bool
 	wg        sync.WaitGroup
+}
+
+type walBatchEntry struct {
+	key   []byte
+	value []byte
 }
 
 func walID() string {
@@ -64,12 +70,11 @@ func openWALForAppend(path string, syncInterval time.Duration) (*wal, error) {
 	return newWAL(path, file, stat.Size() > 0, syncInterval), nil
 }
 
-func newWAL(path string, file *os.File, hasData bool, syncInterval time.Duration) *wal {
+func newWAL(path string, file *os.File, _ bool, syncInterval time.Duration) *wal {
 	w := &wal{
 		path:         path,
 		f:            file,
-		bw:           bufio.NewWriter(file),
-		hasData:      hasData,
+		bw:           bufio.NewWriterSize(file, walBufferedWriterSize),
 		syncInterval: syncInterval,
 	}
 	w.cond = sync.NewCond(&w.mu)
@@ -126,6 +131,16 @@ func replayWAL(path string, fn func(key, value []byte) error) error {
 }
 
 func (w *wal) appendPut(key, value []byte) error {
+	var batch [1]walBatchEntry
+	batch[0] = walBatchEntry{key: key, value: value}
+	return w.appendBatch(batch[:], true)
+}
+
+func (w *wal) appendBatch(entries []walBatchEntry, waitForSync bool) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -136,26 +151,31 @@ func (w *wal) appendPut(key, value []byte) error {
 		return w.syncErr
 	}
 
-	recordSize := walRecordHeaderSize + len(key) + len(value)
-	if cap(w.scratch) < recordSize {
-		w.scratch = make([]byte, recordSize)
+	totalSize := 0
+	for _, entry := range entries {
+		totalSize += walRecordHeaderSize + len(entry.key) + len(entry.value)
 	}
-	record := w.scratch[:recordSize]
-	binary.LittleEndian.PutUint32(record[4:], uint32(len(key)))
-	binary.LittleEndian.PutUint32(record[8:], uint32(len(value)))
-	copy(record[walRecordHeaderSize:], key)
-	copy(record[walRecordHeaderSize+len(key):], value)
-	binary.LittleEndian.PutUint32(record, crc32.ChecksumIEEE(record[4:]))
+	if cap(w.scratch) < totalSize {
+		w.scratch = make([]byte, totalSize)
+	}
+	records := w.scratch[:totalSize]
+	ptr := 0
+	for _, entry := range entries {
+		recordSize := walRecordHeaderSize + len(entry.key) + len(entry.value)
+		record := records[ptr : ptr+recordSize]
+		binary.LittleEndian.PutUint32(record[4:], uint32(len(entry.key)))
+		binary.LittleEndian.PutUint32(record[8:], uint32(len(entry.value)))
+		copy(record[walRecordHeaderSize:], entry.key)
+		copy(record[walRecordHeaderSize+len(entry.key):], entry.value)
+		binary.LittleEndian.PutUint32(record, crc32.ChecksumIEEE(record[4:]))
+		ptr += recordSize
+	}
 
-	if _, err := w.bw.Write(record); err != nil {
-		return err
-	}
-	w.hasData = true
-	w.pending++
+	w.pending += uint64(len(entries))
 	target := w.pending
 
 	if w.syncInterval <= 0 {
-		if err := w.flushAndSyncLocked(); err != nil {
+		if err := w.writeAndSyncRecordLocked(records); err != nil {
 			w.syncErr = err
 			w.cond.Broadcast()
 			return err
@@ -165,7 +185,14 @@ func (w *wal) appendPut(key, value []byte) error {
 		return nil
 	}
 
+	if _, err := w.bw.Write(records); err != nil {
+		return err
+	}
+
 	w.signalSyncLoop(w.wakeCh)
+	if !waitForSync {
+		return nil
+	}
 	for w.durable < target && w.syncErr == nil && !w.closed {
 		w.cond.Wait()
 	}
@@ -211,10 +238,12 @@ func (w *wal) close() error {
 	w.cond.Broadcast()
 	w.signalSyncLoop(w.closeCh)
 	file := w.f
-	w.f = nil
 	w.mu.Unlock()
 
 	w.wg.Wait()
+	w.mu.Lock()
+	w.f = nil
+	w.mu.Unlock()
 	err := w.syncErr
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
@@ -241,7 +270,10 @@ func (w *wal) syncLoop() {
 		}
 		timerCh = nil
 	}
-	resetTimer := func() {
+	startTimer := func() {
+		if timerCh != nil {
+			return
+		}
 		if timer == nil {
 			timer = time.NewTimer(w.syncInterval)
 			timerCh = timer.C
@@ -260,7 +292,7 @@ func (w *wal) syncLoop() {
 	for {
 		select {
 		case <-w.wakeCh:
-			resetTimer()
+			startTimer()
 		case <-timerCh:
 			w.mu.Lock()
 			if w.pending > w.durable && w.syncErr == nil {
@@ -295,13 +327,40 @@ func (w *wal) syncLoop() {
 }
 
 func (w *wal) flushAndSyncLocked() error {
-	if err := w.bw.Flush(); err != nil {
+	if w.bw != nil && w.bw.Buffered() > 0 {
+		if err := w.bw.Flush(); err != nil {
+			return err
+		}
+	}
+	if err := w.f.Sync(); err != nil {
+		return err
+	}
+	w.syncCount++
+	return nil
+}
+
+func (w *wal) writeAndSyncRecordLocked(record []byte) error {
+	if err := writeAll(w.f, record); err != nil {
 		return err
 	}
 	if err := w.f.Sync(); err != nil {
 		return err
 	}
 	w.syncCount++
+	return nil
+}
+
+func writeAll(file *os.File, data []byte) error {
+	for len(data) > 0 {
+		n, err := file.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
 	return nil
 }
 

@@ -62,6 +62,14 @@ func TestLogAppendReadRoundTrip(t *testing.T) {
 		t.Fatalf("beta value mismatch: got %d bytes", len(beta))
 	}
 
+	betaFast, err := log.ReadValue(betaRef)
+	if err != nil {
+		t.Fatalf("ReadValue beta: %v", err)
+	}
+	if !bytes.Equal(betaFast, bytes.Repeat([]byte{'b'}, 512)) {
+		t.Fatalf("beta fast value mismatch: got %d bytes", len(betaFast))
+	}
+
 	if err := log.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
