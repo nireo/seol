@@ -308,3 +308,43 @@ func TestOpenSSTableGet(t *testing.T) {
 		t.Fatalf("get %q after close: got %q, want nil", missing, got)
 	}
 }
+
+func TestOpenSSTableGetUsesParsedBlockLookups(t *testing.T) {
+	dir := t.TempDir()
+	s := skiplist.New(1 << 20)
+
+	expected := make(map[string][]byte, 64)
+	for i := range 64 {
+		key := "key-" + strconv.Itoa(i)
+		value := []byte("value-" + strconv.Itoa(i))
+		expected[key] = value
+		s.Put([]byte(key), value)
+	}
+
+	flushed, err := Flush(dir, s)
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	path := flushed.f.Name()
+	if err := flushed.Close(); err != nil {
+		t.Fatalf("close flushed table: %v", err)
+	}
+
+	loaded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = loaded.Close() }()
+
+	for pass := 0; pass < 2; pass++ {
+		for key, want := range expected {
+			got, err := loaded.Get([]byte(key))
+			if err != nil {
+				t.Fatalf("get %q on pass %d: %v", key, pass, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("get %q on pass %d: got %q, want %q", key, pass, got, want)
+			}
+		}
+	}
+}

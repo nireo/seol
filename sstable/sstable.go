@@ -30,6 +30,8 @@ const (
 	entryMetaSize          int    = 2 + 4     // uint16 (keylen) + uint32 (vallen)
 	dataRangeMetaSize      int    = 2 + 8 + 4 // uint16 (keylen) + uint64 (offset) + uint32 (datablock length)
 	bloomFalsePositiveRate        = 0.01
+	blockCacheShardCount          = 16
+	blockCacheEntryLimit          = 256
 )
 
 var dataBlockPool = sync.Pool{
@@ -50,6 +52,147 @@ func putDataBlock(block []byte) {
 		return
 	}
 	dataBlockPool.Put(block[:sstableBlockSize])
+}
+
+type cachedDataBlock struct {
+	data         []byte
+	entryOffsets []uint32
+}
+
+func newCachedDataBlock(raw []byte) (*cachedDataBlock, error) {
+	block := &cachedDataBlock{data: append([]byte(nil), raw...)}
+	ptr := 0
+	for ptr < len(block.data) {
+		if len(block.data)-ptr < entryMetaSize {
+			return nil, fmt.Errorf("sstable: truncated entry header")
+		}
+
+		block.entryOffsets = append(block.entryOffsets, uint32(ptr))
+		klen := int(binary.LittleEndian.Uint16(block.data[ptr:]))
+		vlen := int(binary.LittleEndian.Uint32(block.data[ptr+2:]))
+		ptr += entryMetaSize
+		if ptr+klen+vlen > len(block.data) {
+			return nil, fmt.Errorf("sstable: truncated entry body")
+		}
+		ptr += klen + vlen
+	}
+	return block, nil
+}
+
+func (b *cachedDataBlock) lookup(key []byte) []byte {
+	idx := sort.Search(len(b.entryOffsets), func(i int) bool {
+		entryKey, _ := b.entryAt(i)
+		return bytes.Compare(entryKey, key) >= 0
+	})
+	if idx == len(b.entryOffsets) {
+		return nil
+	}
+
+	entryKey, value := b.entryAt(idx)
+	if !bytes.Equal(entryKey, key) {
+		return nil
+	}
+	return value
+}
+
+func (b *cachedDataBlock) entryAt(i int) ([]byte, []byte) {
+	ptr := int(b.entryOffsets[i])
+	klen := int(binary.LittleEndian.Uint16(b.data[ptr:]))
+	vlen := int(binary.LittleEndian.Uint32(b.data[ptr+2:]))
+	ptr += entryMetaSize
+	key := b.data[ptr : ptr+klen]
+	ptr += klen
+	value := b.data[ptr : ptr+vlen]
+	return key, value
+}
+
+type dataBlockCacheShard struct {
+	mu         sync.RWMutex
+	blocks     map[uint64]*cachedDataBlock
+	order      []uint64
+	maxEntries int
+}
+
+type dataBlockCache struct {
+	shards []dataBlockCacheShard
+}
+
+func newDataBlockCache(maxEntries int) *dataBlockCache {
+	if maxEntries < 1 {
+		return nil
+	}
+	shardCount := blockCacheShardCount
+	if maxEntries < shardCount {
+		shardCount = maxEntries
+	}
+	perShard := (maxEntries + shardCount - 1) / shardCount
+	cache := &dataBlockCache{shards: make([]dataBlockCacheShard, shardCount)}
+	for i := range cache.shards {
+		cache.shards[i] = dataBlockCacheShard{
+			blocks:     make(map[uint64]*cachedDataBlock, perShard),
+			order:      make([]uint64, 0, perShard),
+			maxEntries: perShard,
+		}
+	}
+	return cache
+}
+
+func (c *dataBlockCache) get(offset uint64) (*cachedDataBlock, bool) {
+	if c == nil {
+		return nil, false
+	}
+	shard := c.shard(offset)
+	shard.mu.RLock()
+	block, ok := shard.blocks[offset]
+	shard.mu.RUnlock()
+	return block, ok
+}
+
+func (c *dataBlockCache) add(offset uint64, block *cachedDataBlock) {
+	if c == nil || block == nil {
+		return
+	}
+	shard := c.shard(offset)
+	shard.mu.Lock()
+	if _, ok := shard.blocks[offset]; ok {
+		shard.blocks[offset] = block
+		shard.mu.Unlock()
+		return
+	}
+	if len(shard.blocks) >= shard.maxEntries {
+		shard.evictOldestLocked()
+	}
+	shard.blocks[offset] = block
+	shard.order = append(shard.order, offset)
+	shard.mu.Unlock()
+}
+
+func (c *dataBlockCache) clear() {
+	if c == nil {
+		return
+	}
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		clear(shard.blocks)
+		shard.order = shard.order[:0]
+		shard.mu.Unlock()
+	}
+}
+
+func (c *dataBlockCache) shard(offset uint64) *dataBlockCacheShard {
+	return &c.shards[offset%uint64(len(c.shards))]
+}
+
+func (s *dataBlockCacheShard) evictOldestLocked() {
+	for len(s.order) > 0 {
+		oldest := s.order[0]
+		s.order = s.order[1:]
+		if _, ok := s.blocks[oldest]; ok {
+			delete(s.blocks, oldest)
+			return
+		}
+	}
 }
 
 type dataRange struct {
@@ -159,8 +302,9 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 	}()
 
 	sst := &Table{
-		idx: tableIndex{},
-		f:   file,
+		idx:        tableIndex{},
+		f:          file,
+		blockCache: newDataBlockCache(blockCacheEntryLimit),
 	}
 
 	entryCount := 0
@@ -347,16 +491,17 @@ func Open(path string) (*Table, error) {
 		}
 	}
 
-	sst := &Table{f: file, filter: filter}
+	sst := &Table{f: file, filter: filter, blockCache: newDataBlockCache(blockCacheEntryLimit)}
 	sst.idx.decodeFullRange(indexData)
 	cleanup = false
 	return sst, nil
 }
 
 type Table struct {
-	idx    tableIndex
-	filter *bloom.Filter
-	f      *os.File
+	idx        tableIndex
+	filter     *bloom.Filter
+	f          *os.File
+	blockCache *dataBlockCache
 }
 
 func (s *Table) Get(key []byte) ([]byte, error) {
@@ -369,42 +514,39 @@ func (s *Table) Get(key []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	block := getDataBlock(ra.length)
-	defer putDataBlock(block)
-	if _, err := s.f.ReadAt(block, int64(ra.offset)); err != nil && err != io.EOF {
+	block, err := s.getCachedBlock(ra)
+	if err != nil {
 		return nil, err
 	}
-
-	ptr := 0
-	for ptr < len(block) {
-		if len(block)-ptr < entryMetaSize {
-			return nil, fmt.Errorf("sstable: truncated entry header")
-		}
-
-		klen := int(binary.LittleEndian.Uint16(block[ptr:]))
-		vlen := int(binary.LittleEndian.Uint32(block[ptr+2:]))
-		ptr += entryMetaSize
-		if ptr+klen+vlen > len(block) {
-			return nil, fmt.Errorf("sstable: truncated entry body")
-		}
-
-		entryKey := block[ptr : ptr+klen]
-		ptr += klen
-		value := block[ptr : ptr+vlen]
-		ptr += vlen
-
-		cmp := bytes.Compare(entryKey, key)
-		if cmp == 0 {
-			return append([]byte(nil), value...), nil
-		}
-		if cmp > 0 {
-			return nil, nil
-		}
+	value := block.lookup(key)
+	if value == nil {
+		return nil, nil
 	}
-
-	return nil, nil
+	return append([]byte(nil), value...), nil
 }
 
 func (s *Table) Close() error {
+	if s.blockCache != nil {
+		s.blockCache.clear()
+	}
 	return s.f.Close()
+}
+
+func (s *Table) getCachedBlock(ra *dataRange) (*cachedDataBlock, error) {
+	if block, ok := s.blockCache.get(ra.offset); ok {
+		return block, nil
+	}
+
+	raw := getDataBlock(ra.length)
+	defer putDataBlock(raw)
+	if _, err := s.f.ReadAt(raw, int64(ra.offset)); err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	block, err := newCachedDataBlock(raw)
+	if err != nil {
+		return nil, err
+	}
+	s.blockCache.add(ra.offset, block)
+	return block, nil
 }
