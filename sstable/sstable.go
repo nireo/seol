@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/nireo/seol/bloom"
@@ -30,6 +31,26 @@ const (
 	dataRangeMetaSize      int    = 2 + 8 + 4 // uint16 (keylen) + uint64 (offset) + uint32 (datablock length)
 	bloomFalsePositiveRate        = 0.01
 )
+
+var dataBlockPool = sync.Pool{
+	New: func() any {
+		return make([]byte, sstableBlockSize)
+	},
+}
+
+func getDataBlock(length uint32) []byte {
+	if int(length) > sstableBlockSize {
+		return make([]byte, int(length))
+	}
+	return dataBlockPool.Get().([]byte)[:int(length)]
+}
+
+func putDataBlock(block []byte) {
+	if cap(block) != sstableBlockSize {
+		return
+	}
+	dataBlockPool.Put(block[:sstableBlockSize])
+}
 
 type dataRange struct {
 	firstKey []byte
@@ -348,7 +369,8 @@ func (s *Table) Get(key []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	block := make([]byte, ra.length)
+	block := getDataBlock(ra.length)
+	defer putDataBlock(block)
 	if _, err := s.f.ReadAt(block, int64(ra.offset)); err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -373,7 +395,7 @@ func (s *Table) Get(key []byte) ([]byte, error) {
 
 		cmp := bytes.Compare(entryKey, key)
 		if cmp == 0 {
-			return value, nil
+			return append([]byte(nil), value...), nil
 		}
 		if cmp > 0 {
 			return nil, nil
