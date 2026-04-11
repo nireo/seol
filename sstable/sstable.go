@@ -36,22 +36,36 @@ const (
 
 var dataBlockPool = sync.Pool{
 	New: func() any {
-		return make([]byte, sstableBlockSize)
+		return &pooledDataBlock{}
 	},
 }
 
-func getDataBlock(length uint32) []byte {
-	if int(length) > sstableBlockSize {
-		return make([]byte, int(length))
-	}
-	return dataBlockPool.Get().([]byte)[:int(length)]
+type pooledDataBlock struct {
+	buf [sstableBlockSize]byte
 }
 
-func putDataBlock(block []byte) {
-	if cap(block) != sstableBlockSize {
+type leasedDataBlock struct {
+	data   []byte
+	pooled *pooledDataBlock
+}
+
+func getDataBlock(length uint32) leasedDataBlock {
+	if int(length) > sstableBlockSize {
+		return leasedDataBlock{data: make([]byte, int(length))}
+	}
+
+	pooled := dataBlockPool.Get().(*pooledDataBlock)
+	return leasedDataBlock{
+		data:   pooled.buf[:int(length)],
+		pooled: pooled,
+	}
+}
+
+func putDataBlock(block leasedDataBlock) {
+	if block.pooled == nil {
 		return
 	}
-	dataBlockPool.Put(block[:sstableBlockSize])
+	dataBlockPool.Put(block.pooled)
 }
 
 type cachedDataBlock struct {
@@ -590,11 +604,11 @@ func (s *Table) getCachedBlock(ra *dataRange) (*cachedDataBlock, error) {
 
 	raw := getDataBlock(ra.length)
 	defer putDataBlock(raw)
-	if _, err := s.f.ReadAt(raw, int64(ra.offset)); err != nil && err != io.EOF {
+	if _, err := s.f.ReadAt(raw.data, int64(ra.offset)); err != nil && err != io.EOF {
 		return nil, err
 	}
 
-	block, err := newCachedDataBlock(raw)
+	block, err := newCachedDataBlock(raw.data)
 	if err != nil {
 		return nil, err
 	}
