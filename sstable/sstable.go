@@ -268,17 +268,191 @@ func (ti *tableIndex) findDataRange(key []byte) *dataRange {
 
 	idx := sort.Search(len(ti.ranges), func(i int) bool {
 		return bytes.Compare(ti.ranges[i].firstKey, key) > 0
-	}) - 1
-	if idx < 0 {
+	})
+	if idx == 0 {
 		return nil
 	}
 
-	return &ti.ranges[idx]
+	return &ti.ranges[idx-1]
 }
 
 func sstableID() string {
 	id := time.Now().UnixMicro()
 	return fmt.Sprintf("%d.sst", id)
+}
+
+func countEntries(sk *skiplist.Skiplist) int {
+	count := 0
+	it := sk.NewIterator()
+	defer it.Close()
+
+	it.Rewind()
+	for it.Valid() {
+		count++
+		it.Next()
+	}
+
+	return count
+}
+
+func prepareBloomFilter(file *os.File, sk *skiplist.Skiplist) (*bloom.Filter, int, error) {
+	filter := bloom.NewFor(countEntries(sk), bloomFalsePositiveRate)
+	filterData, err := filter.MarshalBinary()
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, err := file.Seek(int64(len(filterData)), io.SeekStart); err != nil {
+		return nil, 0, err
+	}
+	return filter, len(filterData), nil
+}
+
+func appendBlockEntry(block []byte, key, value []byte) []byte {
+	entrySize := entryMetaSize + len(key) + len(value)
+	entryOffset := len(block)
+	block = block[:entryOffset+entrySize]
+	binary.LittleEndian.PutUint16(block[entryOffset:], uint16(len(key)))
+	binary.LittleEndian.PutUint32(block[entryOffset+2:], uint32(len(value)))
+	copy(block[entryOffset+entryMetaSize:], key)
+	copy(block[entryOffset+entryMetaSize+len(key):], value)
+	return block
+}
+
+func writeDataBlocks(bw *bufio.Writer, sk *skiplist.Skiplist, filter *bloom.Filter, startOffset uint64) (tableIndex, uint64, error) {
+	idx := tableIndex{}
+	it := sk.NewIterator()
+	defer it.Close()
+
+	it.Rewind()
+	offset := startOffset
+	block := make([]byte, 0, sstableBlockSize)
+	currentRange := dataRange{}
+	flushBlock := func() error {
+		if len(block) == 0 {
+			return nil
+		}
+
+		currentRange.length = uint32(len(block))
+		idx.ranges = append(idx.ranges, currentRange)
+		if _, err := bw.Write(block); err != nil {
+			return err
+		}
+
+		offset += uint64(len(block))
+		block = block[:0]
+		currentRange = dataRange{}
+		return nil
+	}
+
+	for it.Valid() {
+		key := it.Key()
+		value := it.Value()
+		filter.Add(key)
+
+		entrySize := entryMetaSize + len(key) + len(value)
+		if entrySize > sstableBlockSize {
+			return tableIndex{}, 0, fmt.Errorf("sstable: entry for key %q exceeds block size", key)
+		}
+		if len(block) > 0 && len(block)+entrySize > sstableBlockSize {
+			if err := flushBlock(); err != nil {
+				return tableIndex{}, 0, err
+			}
+		}
+
+		if len(block) == 0 {
+			currentRange.firstKey = append([]byte(nil), key...)
+			currentRange.offset = offset
+		}
+
+		block = appendBlockEntry(block, key, value)
+		it.Next()
+	}
+
+	if err := flushBlock(); err != nil {
+		return tableIndex{}, 0, err
+	}
+
+	return idx, offset, nil
+}
+
+func writeIndexAndFooter(bw *bufio.Writer, idx tableIndex, indexOffset uint64) error {
+	if _, err := bw.Write(idx.encodeFullRange()); err != nil {
+		return err
+	}
+
+	var footer [sstableFooterSize]byte
+	binary.LittleEndian.PutUint64(footer[:], indexOffset)
+	binary.LittleEndian.PutUint32(footer[8:], sstableMagic)
+	footer[12] = sstableVersion
+	_, err := bw.Write(footer[:])
+	return err
+}
+
+func loadBloomFilter(file *os.File, fileSize int64) (*bloom.Filter, int, error) {
+	if fileSize < int64(sstableFooterSize) {
+		return nil, 0, fmt.Errorf("sstable: file too small")
+	}
+
+	var bloomHeader [bloom.HeaderSize]byte
+	if _, err := file.ReadAt(bloomHeader[:], 0); err != nil {
+		return nil, 0, err
+	}
+	if got := binary.LittleEndian.Uint32(bloomHeader[:]); got != bloom.Magic {
+		return nil, 0, fmt.Errorf("sstable: invalid bloom magic %#x", got)
+	}
+	if got := bloomHeader[4]; got != bloom.Version {
+		return nil, 0, fmt.Errorf("sstable: unsupported bloom version %d", got)
+	}
+
+	bloomBits := binary.LittleEndian.Uint64(bloomHeader[5:])
+	if bloomBits == 0 || bloomBits%uint64(bloom.WordBits) != 0 {
+		return nil, 0, fmt.Errorf("sstable: invalid bloom bit count %d", bloomBits)
+	}
+	bloomSize := bloom.HeaderSize + int(bloomBits/uint64(bloom.WordBits))*8
+	if fileSize < int64(bloomSize+sstableFooterSize) {
+		return nil, 0, fmt.Errorf("sstable: file too small for bloom filter")
+	}
+
+	bloomData := make([]byte, bloomSize)
+	if _, err := file.ReadAt(bloomData, 0); err != nil {
+		return nil, 0, err
+	}
+
+	filter, err := bloom.ReadFilter(bloomData)
+	if err != nil {
+		return nil, 0, err
+	}
+	return filter, bloomSize, nil
+}
+
+func readIndexData(file *os.File, fileSize int64, bloomSize int) ([]byte, error) {
+	var footer [sstableFooterSize]byte
+	footerOffset := fileSize - int64(sstableFooterSize)
+	if _, err := file.ReadAt(footer[:], footerOffset); err != nil {
+		return nil, err
+	}
+
+	if got := binary.LittleEndian.Uint32(footer[8:]); got != sstableMagic {
+		return nil, fmt.Errorf("sstable: invalid magic %#x", got)
+	}
+	if got := footer[12]; got != sstableVersion {
+		return nil, fmt.Errorf("sstable: unsupported version %d", got)
+	}
+
+	indexOffset := binary.LittleEndian.Uint64(footer[:])
+	if indexOffset < uint64(bloomSize) || indexOffset > uint64(footerOffset) {
+		return nil, fmt.Errorf("sstable: invalid index offset %d", indexOffset)
+	}
+
+	indexSize := int(footerOffset - int64(indexOffset))
+	indexData := make([]byte, indexSize)
+	if indexSize == 0 {
+		return indexData, nil
+	}
+	if _, err := file.ReadAt(indexData, int64(indexOffset)); err != nil && err != io.EOF {
+		return nil, err
+	}
+	return indexData, nil
 }
 
 func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
@@ -307,95 +481,20 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 		blockCache: newDataBlockCache(blockCacheEntryLimit),
 	}
 
-	entryCount := 0
-	countIt := sk.NewIterator()
-	defer countIt.Close()
-	countIt.Rewind()
-	for countIt.Valid() {
-		entryCount++
-		countIt.Next()
-	}
-
-	filter := bloom.NewFor(entryCount, bloomFalsePositiveRate)
-	filterData, err := filter.MarshalBinary()
+	filter, bloomSize, err := prepareBloomFilter(file, sk)
 	if err != nil {
-		return nil, err
-	}
-	bloomSize := len(filterData)
-	if _, err := file.Seek(int64(bloomSize), io.SeekStart); err != nil {
 		return nil, err
 	}
 	sst.filter = filter
 
-	it := sk.NewIterator()
-	defer it.Close()
-	it.Rewind()
 	bw := bufio.NewWriter(file)
-	offset := uint64(bloomSize)
-	block := make([]byte, 0, sstableBlockSize)
-	currentRange := dataRange{}
-
-	flushBlock := func() error {
-		if len(block) == 0 {
-			return nil
-		}
-
-		currentRange.length = uint32(len(block))
-		sst.idx.ranges = append(sst.idx.ranges, currentRange)
-		if _, err := bw.Write(block); err != nil {
-			return err
-		}
-
-		offset += uint64(len(block))
-		block = block[:0]
-		currentRange = dataRange{}
-		return nil
-	}
-
-	for it.Valid() {
-		key := it.Key()
-		value := it.Value()
-		filter.Add(key)
-		entrySize := entryMetaSize + len(key) + len(value)
-		if entrySize > sstableBlockSize {
-			return nil, fmt.Errorf("sstable: entry for key %q exceeds block size", key)
-		}
-
-		if len(block) > 0 && len(block)+entrySize > sstableBlockSize {
-			if err := flushBlock(); err != nil {
-				return nil, err
-			}
-		}
-
-		if len(block) == 0 {
-			currentRange.firstKey = append([]byte(nil), key...)
-			currentRange.offset = offset
-		}
-
-		entryOffset := len(block)
-		block = block[:entryOffset+entrySize]
-		binary.LittleEndian.PutUint16(block[entryOffset:], uint16(len(key)))
-		binary.LittleEndian.PutUint32(block[entryOffset+2:], uint32(len(value)))
-		copy(block[entryOffset+entryMetaSize:], key)
-		copy(block[entryOffset+entryMetaSize+len(key):], value)
-
-		it.Next()
-	}
-	if err := flushBlock(); err != nil {
+	idx, indexOffset, err := writeDataBlocks(bw, sk, filter, uint64(bloomSize))
+	if err != nil {
 		return nil, err
 	}
+	sst.idx = idx
 
-	indexOffset := offset
-	indexData := sst.idx.encodeFullRange()
-	if _, err := bw.Write(indexData); err != nil {
-		return nil, err
-	}
-
-	footer := make([]byte, sstableFooterSize)
-	binary.LittleEndian.PutUint64(footer, indexOffset)
-	binary.LittleEndian.PutUint32(footer[8:], sstableMagic)
-	footer[12] = sstableVersion
-	if _, err := bw.Write(footer); err != nil {
+	if err := writeIndexAndFooter(bw, sst.idx, indexOffset); err != nil {
 		return nil, err
 	}
 
@@ -403,7 +502,7 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 		return nil, err
 	}
 
-	filterData, err = filter.MarshalBinary()
+	filterData, err := filter.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
@@ -432,63 +531,15 @@ func Open(path string) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	if stat.Size() < int64(sstableFooterSize) {
-		return nil, fmt.Errorf("sstable: file too small")
-	}
 
-	bloomHeader := make([]byte, bloom.HeaderSize)
-	if _, err := file.ReadAt(bloomHeader, 0); err != nil {
-		return nil, err
-	}
-	if got := binary.LittleEndian.Uint32(bloomHeader); got != bloom.Magic {
-		return nil, fmt.Errorf("sstable: invalid bloom magic %#x", got)
-	}
-	if got := bloomHeader[4]; got != bloom.Version {
-		return nil, fmt.Errorf("sstable: unsupported bloom version %d", got)
-	}
-
-	bloomBits := binary.LittleEndian.Uint64(bloomHeader[5:])
-	if bloomBits == 0 || bloomBits%uint64(bloom.WordBits) != 0 {
-		return nil, fmt.Errorf("sstable: invalid bloom bit count %d", bloomBits)
-	}
-	bloomSize := bloom.HeaderSize + int(bloomBits/uint64(bloom.WordBits))*8
-	if stat.Size() < int64(bloomSize+sstableFooterSize) {
-		return nil, fmt.Errorf("sstable: file too small for bloom filter")
-	}
-
-	bloomData := make([]byte, bloomSize)
-	if _, err := file.ReadAt(bloomData, 0); err != nil {
-		return nil, err
-	}
-	filter, err := bloom.ReadFilter(bloomData)
+	filter, bloomSize, err := loadBloomFilter(file, stat.Size())
 	if err != nil {
 		return nil, err
 	}
 
-	footer := make([]byte, sstableFooterSize)
-	footerOffset := stat.Size() - int64(sstableFooterSize)
-	if _, err := file.ReadAt(footer, footerOffset); err != nil {
+	indexData, err := readIndexData(file, stat.Size(), bloomSize)
+	if err != nil {
 		return nil, err
-	}
-
-	if got := binary.LittleEndian.Uint32(footer[8:]); got != sstableMagic {
-		return nil, fmt.Errorf("sstable: invalid magic %#x", got)
-	}
-	if got := footer[12]; got != sstableVersion {
-		return nil, fmt.Errorf("sstable: unsupported version %d", got)
-	}
-
-	indexOffset := binary.LittleEndian.Uint64(footer)
-	if indexOffset < uint64(bloomSize) || indexOffset > uint64(footerOffset) {
-		return nil, fmt.Errorf("sstable: invalid index offset %d", indexOffset)
-	}
-
-	indexSize := int(footerOffset - int64(indexOffset))
-	indexData := make([]byte, indexSize)
-	if indexSize > 0 {
-		if _, err := file.ReadAt(indexData, int64(indexOffset)); err != nil && err != io.EOF {
-			return nil, err
-		}
 	}
 
 	sst := &Table{f: file, filter: filter, blockCache: newDataBlockCache(blockCacheEntryLimit)}

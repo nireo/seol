@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -237,6 +238,52 @@ func TestDBAsyncWritesReadYourWriteAndPersistOnClose(t *testing.T) {
 	}
 }
 
+func TestDBConcurrentPutAndCloseDoesNotDeadlock(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_ = db.Put([]byte("key-"+strings.Repeat("x", i%4)+string(rune('a'+i%26))), []byte("value"))
+		}(i)
+	}
+
+	close(start)
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- db.Close()
+	}()
+
+	putsDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(putsDone)
+	}()
+
+	select {
+	case <-putsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("concurrent puts did not complete")
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close db: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("close did not complete")
+	}
+}
+
 func TestDBReadsFromImmutableWhileFlushInProgress(t *testing.T) {
 	dir := t.TempDir()
 	started := make(chan struct{}, 1)
@@ -368,11 +415,11 @@ func stopDBWithoutFlush(t *testing.T, db *DB) {
 		return
 	}
 	db.closed = true
+	db.publishReadStateLocked()
 	db.mu.Unlock()
 
-	db.submitMu.Lock()
+	db.waitForSubmitters()
 	db.writeCh <- nil
-	db.submitMu.Unlock()
 	db.writeWg.Wait()
 
 	db.mu.Lock()

@@ -100,6 +100,9 @@ type DB struct {
 	writeCh          chan *writeRequest
 	flushCh          chan *immutableMemtable
 	readState        atomic.Pointer[dbReadState]
+	submitCond       *sync.Cond
+	submitters       atomic.Int64
+	commitWg         sync.WaitGroup
 
 	mu       sync.RWMutex
 	submitMu sync.Mutex
@@ -117,29 +120,26 @@ func OpenWithOptions(dir string, opts Options) (*DB, error) {
 	return openDB(dir, opts, sstable.Flush)
 }
 
-func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)) (*DB, error) {
+func normalizeOptions(opts Options) Options {
 	if opts.MemtableMaxBytes <= 0 {
 		opts.MemtableMaxBytes = defaultMemtableMaxBytes
 	}
 	if opts.ValueThreshold <= 0 {
 		opts.ValueThreshold = defaultValueThreshold
 	}
-	if opts.WriteBatchWindow < 0 {
+	switch {
+	case opts.WriteBatchWindow < 0:
 		opts.WriteBatchWindow = 0
-	} else if opts.WriteBatchWindow == 0 {
+	case opts.WriteBatchWindow == 0:
 		opts.WriteBatchWindow = defaultWriteBatchWindow
 	}
-	if flushFn == nil {
-		flushFn = sstable.Flush
-	}
+	return opts
+}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-
+func scanDataFiles(dir string) ([]string, []string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var sstPaths []string
@@ -157,38 +157,47 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 			walPaths = append(walPaths, path)
 		}
 	}
+
 	sort.Slice(sstPaths, func(i, j int) bool {
 		return filepath.Base(sstPaths[i]) > filepath.Base(sstPaths[j])
 	})
 	sort.Slice(walPaths, func(i, j int) bool {
 		return filepath.Base(walPaths[i]) < filepath.Base(walPaths[j])
 	})
+	return sstPaths, walPaths, nil
+}
 
-	sstables := make([]*sstable.Table, 0, len(sstPaths))
-	for _, path := range sstPaths {
+func openSSTables(paths []string) ([]*sstable.Table, error) {
+	sstables := make([]*sstable.Table, 0, len(paths))
+	for _, path := range paths {
 		sst, err := sstable.Open(path)
 		if err != nil {
-			for _, opened := range sstables {
-				_ = opened.Close()
-			}
+			closeSSTables(sstables)
 			return nil, err
 		}
 		sstables = append(sstables, sst)
 	}
+	return sstables, nil
+}
 
-	valueLog, err := vlog.Open(dir, vlog.Options{SegmentMaxBytes: opts.ValueLogSegmentMaxBytes})
-	if err != nil {
-		for _, opened := range sstables {
-			_ = opened.Close()
-		}
-		return nil, err
+func closeSSTables(sstables []*sstable.Table) {
+	for _, sst := range sstables {
+		_ = sst.Close()
 	}
+}
 
-	memtable := skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
+func closeOpenResources(valueLog *vlog.Log, sstables []*sstable.Table) {
+	if valueLog != nil {
+		_ = valueLog.Close()
+	}
+	closeSSTables(sstables)
+}
+
+func replayWALs(paths []string, valueLog *vlog.Log, valueThreshold int, memtable *skiplist.Skiplist) (int64, error) {
 	var memtableBytes int64
-	for _, path := range walPaths {
+	for _, path := range paths {
 		if err := replayWAL(path, func(key, value []byte) error {
-			stored, err := storeValueForLSM(valueLog, opts.ValueThreshold, key, value)
+			stored, err := storeValueForLSM(valueLog, valueThreshold, key, value)
 			if err != nil {
 				return err
 			}
@@ -196,20 +205,48 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 			memtableBytes += memtableEntrySize(key, value)
 			return nil
 		}); err != nil {
-			_ = valueLog.Close()
-			for _, opened := range sstables {
-				_ = opened.Close()
-			}
-			return nil, err
+			return 0, err
 		}
+	}
+	return memtableBytes, nil
+}
+
+func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)) (*DB, error) {
+	opts = normalizeOptions(opts)
+	if flushFn == nil {
+		flushFn = sstable.Flush
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+
+	sstPaths, walPaths, err := scanDataFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	sstables, err := openSSTables(sstPaths)
+	if err != nil {
+		return nil, err
+	}
+
+	valueLog, err := vlog.Open(dir, vlog.Options{SegmentMaxBytes: opts.ValueLogSegmentMaxBytes})
+	if err != nil {
+		closeSSTables(sstables)
+		return nil, err
+	}
+
+	memtable := skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
+	memtableBytes, err := replayWALs(walPaths, valueLog, opts.ValueThreshold, memtable)
+	if err != nil {
+		closeOpenResources(valueLog, sstables)
+		return nil, err
 	}
 
 	activeWal, err := createWAL(dir, opts.WALSyncInterval)
 	if err != nil {
-		_ = valueLog.Close()
-		for _, opened := range sstables {
-			_ = opened.Close()
-		}
+		closeOpenResources(valueLog, sstables)
 		return nil, err
 	}
 
@@ -232,6 +269,7 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 		writeCh:          make(chan *writeRequest, 256),
 		flushCh:          make(chan *immutableMemtable, 1),
 	}
+	db.submitCond = sync.NewCond(&db.submitMu)
 	db.publishReadState()
 	db.writeWg.Add(1)
 	go db.writeLoop()
@@ -252,25 +290,23 @@ func memtableArenaSize(maxBytes int64) int64 {
 func (db *DB) Put(key, value []byte) error {
 	req := acquireWriteRequest(key, value)
 
-	db.submitMu.Lock()
-	db.mu.RLock()
-	if db.closed {
-		db.mu.RUnlock()
-		db.submitMu.Unlock()
+	if !db.beginSubmit() {
 		req.finish(errors.New("seol: db is closed"))
 		return req.wait()
 	}
+
+	db.mu.RLock()
 	if db.flushErr != nil {
 		err := db.flushErr
 		db.mu.RUnlock()
-		db.submitMu.Unlock()
+		db.finishSubmit()
 		req.finish(err)
 		return req.wait()
 	}
 	db.mu.RUnlock()
 
 	db.writeCh <- req
-	db.submitMu.Unlock()
+	db.finishSubmit()
 	return req.wait()
 }
 
@@ -304,23 +340,13 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 }
 
 func (db *DB) Close() error {
-	db.submitMu.Lock()
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
-		db.submitMu.Unlock()
+	if !db.markClosed() {
 		return nil
 	}
-	db.closed = true
-	db.publishReadStateLocked()
-	db.mu.Unlock()
-	db.writeCh <- nil
-	db.submitMu.Unlock()
 
-	db.writeWg.Wait()
+	db.stopWrites()
 
 	db.mu.Lock()
-
 	var toFlush *immutableMemtable
 	if db.memtable != nil && !db.memtable.Empty() {
 		if err := db.activeWal.close(); err != nil {
@@ -332,79 +358,97 @@ func (db *DB) Close() error {
 			walPaths: append([]string(nil), db.currentWalPaths...),
 		}
 		db.immutable = append(db.immutable, toFlush)
-	} else if db.activeWal != nil {
-		activeWal := db.activeWal
-		db.activeWal = nil
-		db.currentWalPaths = nil
-		db.memtable = nil
-		db.mu.Unlock()
-		err := activeWal.close()
-		if removeErr := os.Remove(activeWal.path); err == nil && removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			err = removeErr
-		}
-		close(db.flushCh)
-		db.flushWg.Wait()
-
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		var closeErr error
-		if db.flushErr != nil {
-			closeErr = db.flushErr
-		}
-		if err != nil && closeErr == nil {
-			closeErr = err
-		}
-		if db.valueLog != nil {
-			if closeVLogErr := db.valueLog.Close(); closeVLogErr != nil && closeErr == nil {
-				closeErr = closeVLogErr
-			}
-		}
-		for _, sst := range db.sstables {
-			if closeSSTErr := sst.Close(); closeSSTErr != nil && closeErr == nil {
-				closeErr = closeSSTErr
-			}
-		}
-		return closeErr
 	}
 
+	activeWal := db.activeWal
 	db.memtable = nil
 	db.activeWal = nil
 	db.currentWalPaths = nil
 	db.mu.Unlock()
 
-	if toFlush != nil {
-		db.flushCh <- toFlush
+	if toFlush == nil {
+		return db.closeWithoutPendingFlush(activeWal)
 	}
+
+	return db.flushPendingMemtableAndClose(toFlush)
+}
+
+func (db *DB) markClosed() bool {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return false
+	}
+	db.closed = true
+	db.publishReadStateLocked()
+	return true
+}
+
+func (db *DB) stopWrites() {
+	db.waitForSubmitters()
+	db.writeCh <- nil
+	db.writeWg.Wait()
+}
+
+func (db *DB) closeWithoutPendingFlush(activeWal *wal) error {
+	walCloseErr := closeAndRemoveWAL(activeWal)
 	close(db.flushCh)
 	db.flushWg.Wait()
+	db.commitWg.Wait()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	return db.closeStorageLocked(walCloseErr)
+}
 
-	var closeErr error
-	if db.flushErr != nil {
-		closeErr = db.flushErr
+func (db *DB) flushPendingMemtableAndClose(toFlush *immutableMemtable) error {
+	db.flushCh <- toFlush
+	close(db.flushCh)
+	db.flushWg.Wait()
+	db.commitWg.Wait()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.closeStorageLocked(nil)
+}
+
+func closeAndRemoveWAL(activeWal *wal) error {
+	if activeWal == nil {
+		return nil
 	}
+
+	err := activeWal.close()
+	if removeErr := os.Remove(activeWal.path); err == nil && removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		err = removeErr
+	}
+	return err
+}
+
+func (db *DB) closeStorageLocked(extraErr error) error {
+	closeErr := db.flushErr
+	closeErr = firstError(closeErr, extraErr)
 	if db.valueLog != nil {
-		if err := db.valueLog.Close(); err != nil && closeErr == nil {
-			closeErr = err
-		}
+		closeErr = firstError(closeErr, db.valueLog.Close())
 	}
 	for _, sst := range db.sstables {
-		if err := sst.Close(); err != nil && closeErr == nil {
-			closeErr = err
-		}
+		closeErr = firstError(closeErr, sst.Close())
 	}
-
 	return closeErr
+}
+
+func firstError(err, next error) error {
+	if err != nil {
+		return err
+	}
+	return next
 }
 
 func (db *DB) writeLoop() {
 	defer db.writeWg.Done()
 
-	batch := make([]*writeRequest, 0, 64)
-	walBatch := make([]walBatchEntry, 0, 64)
-	storedBatch := make([][]byte, 0, 64)
+	batch := make([]*writeRequest, 0, 256)
+	walBatch := make([]walBatchEntry, 0, 256)
+	storedBatch := make([][]byte, 0, 256)
 
 	for {
 		req := <-db.writeCh
@@ -412,55 +456,28 @@ func (db *DB) writeLoop() {
 			return
 		}
 
-		batch = append(batch[:0], req)
-		closing := false
-		for len(batch) < cap(batch) {
-			select {
-			case req = <-db.writeCh:
-				if req == nil {
-					closing = true
-					goto processBatch
-				}
-				batch = append(batch, req)
-			default:
-				goto processBatch
-			}
-		}
-
-		if len(batch) == 1 && db.writeBatchWindow > 0 {
-			timer := time.NewTimer(db.writeBatchWindow)
-			for len(batch) < cap(batch) {
-				select {
-				case req = <-db.writeCh:
-					if req == nil {
-						closing = true
-						if !timer.Stop() {
-							select {
-							case <-timer.C:
-							default:
-							}
-						}
-						goto processBatch
-					}
-					batch = append(batch, req)
-				case <-timer.C:
-					goto processBatch
-				}
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-		}
-
-	processBatch:
+		batch, closing := db.collectWriteBatch(req, batch)
 		db.processWriteBatch(batch, &walBatch, &storedBatch)
 		if closing {
 			return
 		}
 	}
+}
+
+func (db *DB) collectWriteBatch(first *writeRequest, batch []*writeRequest) ([]*writeRequest, bool) {
+	batch = append(batch[:0], first)
+	for len(batch) < cap(batch) {
+		select {
+		case req := <-db.writeCh:
+			if req == nil {
+				return batch, true
+			}
+			batch = append(batch, req)
+		default:
+			return batch, false
+		}
+	}
+	return batch, false
 }
 
 func (db *DB) processWriteBatch(batch []*writeRequest, walBatchBuf *[]walBatchEntry, storedBatchBuf *[][]byte) {
@@ -603,50 +620,52 @@ func (db *DB) flushLoop() {
 	defer db.flushWg.Done()
 
 	for imm := range db.flushCh {
-		if err := db.valueLog.Sync(); err != nil {
-			db.mu.Lock()
-			if db.flushErr == nil {
-				db.flushErr = fmt.Errorf("seol: sync value log: %w", err)
-			}
-			db.mu.Unlock()
+		if err := db.syncValueLogForFlush(); err != nil {
 			continue
 		}
+
 		sst, err := db.flushFn(db.dir, imm.table)
-
-		db.mu.Lock()
 		if err != nil {
-			if db.flushErr == nil {
-				db.flushErr = fmt.Errorf("seol: flush memtable: %w", err)
-			}
-			db.mu.Unlock()
+			db.setFlushErrIfNil(fmt.Errorf("seol: flush memtable: %w", err))
 			continue
 		}
 
-		idx := -1
-		for i := range db.immutable {
-			if db.immutable[i] == imm {
-				idx = i
-				break
-			}
-		}
-		if idx >= 0 {
-			db.immutable = append(db.immutable[:idx], db.immutable[idx+1:]...)
-		}
-		db.sstables = append([]*sstable.Table{sst}, db.sstables...)
-		db.publishReadStateLocked()
-		db.mu.Unlock()
-
-		for _, path := range imm.walPaths {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				db.mu.Lock()
-				if db.flushErr == nil {
-					db.flushErr = fmt.Errorf("seol: remove wal %s: %w", filepath.Base(path), err)
-				}
-				db.mu.Unlock()
-				break
-			}
+		db.installFlushedTable(imm, sst)
+		if err := removeWALFiles(imm.walPaths); err != nil {
+			db.setFlushErrIfNil(err)
 		}
 	}
+}
+
+func (db *DB) syncValueLogForFlush() error {
+	if err := db.valueLog.Sync(); err != nil {
+		return db.setFlushErrIfNil(fmt.Errorf("seol: sync value log: %w", err))
+	}
+	return nil
+}
+
+func (db *DB) installFlushedTable(imm *immutableMemtable, sst *sstable.Table) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	for i := range db.immutable {
+		if db.immutable[i] != imm {
+			continue
+		}
+		db.immutable = append(db.immutable[:i], db.immutable[i+1:]...)
+		break
+	}
+	db.sstables = append([]*sstable.Table{sst}, db.sstables...)
+	db.publishReadStateLocked()
+}
+
+func removeWALFiles(paths []string) error {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("seol: remove wal %s: %w", filepath.Base(path), err)
+		}
+	}
+	return nil
 }
 
 func (db *DB) currentReadState() *dbReadState {
@@ -684,4 +703,30 @@ func (db *DB) snapshotReadStateLocked() *dbReadState {
 		state.sstables = append([]*sstable.Table(nil), db.sstables...)
 	}
 	return state
+}
+
+func (db *DB) beginSubmit() bool {
+	db.submitters.Add(1)
+	if db.currentReadState().closed {
+		db.finishSubmit()
+		return false
+	}
+	return true
+}
+
+func (db *DB) finishSubmit() {
+	if db.submitters.Add(-1) != 0 {
+		return
+	}
+	db.submitMu.Lock()
+	db.submitCond.Broadcast()
+	db.submitMu.Unlock()
+}
+
+func (db *DB) waitForSubmitters() {
+	db.submitMu.Lock()
+	for db.submitters.Load() != 0 {
+		db.submitCond.Wait()
+	}
+	db.submitMu.Unlock()
 }

@@ -274,11 +274,11 @@ func benchmarkStopDBWithoutFlush(b *testing.B, db *DB) {
 		return
 	}
 	db.closed = true
+	db.publishReadStateLocked()
 	db.mu.Unlock()
 
-	db.submitMu.Lock()
+	db.waitForSubmitters()
 	db.writeCh <- nil
-	db.submitMu.Unlock()
 	db.writeWg.Wait()
 
 	db.mu.Lock()
