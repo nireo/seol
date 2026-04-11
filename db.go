@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nireo/seol/skiplist"
@@ -73,6 +74,14 @@ type Options struct {
 	WriteBatchWindow        time.Duration
 }
 
+type dbReadState struct {
+	closed    bool
+	memtable  *skiplist.Skiplist
+	immutable []*immutableMemtable
+	sstables  []*sstable.Table
+	valueLog  *vlog.Log
+}
+
 type DB struct {
 	dir              string
 	memtableMaxBytes int64
@@ -90,6 +99,7 @@ type DB struct {
 	flushFn          func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)
 	writeCh          chan *writeRequest
 	flushCh          chan *immutableMemtable
+	readState        atomic.Pointer[dbReadState]
 
 	mu       sync.RWMutex
 	submitMu sync.Mutex
@@ -222,6 +232,7 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 		writeCh:          make(chan *writeRequest, 256),
 		flushCh:          make(chan *immutableMemtable, 1),
 	}
+	db.publishReadState()
 	db.writeWg.Add(1)
 	go db.writeLoop()
 	db.flushWg.Add(1)
@@ -264,31 +275,28 @@ func (db *DB) Put(key, value []byte) error {
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
-	db.mu.RLock()
-	if db.closed {
-		db.mu.RUnlock()
+	state := db.currentReadState()
+	if state.closed {
 		return nil, errors.New("seol: db is closed")
 	}
-	memtable := db.memtable
-	immutable := append([]*immutableMemtable(nil), db.immutable...)
-	sstables := db.sstables
-	db.mu.RUnlock()
 
-	if stored := memtable.Get(key); stored != nil {
-		return resolveStoredValue(db.valueLog, stored)
-	}
-	for i := len(immutable) - 1; i >= 0; i-- {
-		if stored := immutable[i].table.Get(key); stored != nil {
-			return resolveStoredValue(db.valueLog, stored)
+	if state.memtable != nil {
+		if stored := state.memtable.Get(key); stored != nil {
+			return resolveStoredValue(state.valueLog, stored)
 		}
 	}
-	for _, sst := range sstables {
+	for i := len(state.immutable) - 1; i >= 0; i-- {
+		if stored := state.immutable[i].table.Get(key); stored != nil {
+			return resolveStoredValue(state.valueLog, stored)
+		}
+	}
+	for _, sst := range state.sstables {
 		stored, err := sst.Get(key)
 		if err != nil {
 			return nil, err
 		}
 		if stored != nil {
-			return resolveStoredValue(db.valueLog, stored)
+			return resolveStoredValue(state.valueLog, stored)
 		}
 	}
 
@@ -304,6 +312,7 @@ func (db *DB) Close() error {
 		return nil
 	}
 	db.closed = true
+	db.publishReadStateLocked()
 	db.mu.Unlock()
 	db.writeCh <- nil
 	db.submitMu.Unlock()
@@ -566,6 +575,7 @@ func (db *DB) rotateMemtable() error {
 	db.memtable = newMemtable
 	db.activeWal = nextWal
 	db.currentWalPaths = []string{nextWal.path}
+	db.publishReadStateLocked()
 	db.mu.Unlock()
 
 	db.memtableBytes = 0
@@ -623,6 +633,7 @@ func (db *DB) flushLoop() {
 			db.immutable = append(db.immutable[:idx], db.immutable[idx+1:]...)
 		}
 		db.sstables = append([]*sstable.Table{sst}, db.sstables...)
+		db.publishReadStateLocked()
 		db.mu.Unlock()
 
 		for _, path := range imm.walPaths {
@@ -636,4 +647,41 @@ func (db *DB) flushLoop() {
 			}
 		}
 	}
+}
+
+func (db *DB) currentReadState() *dbReadState {
+	if state := db.readState.Load(); state != nil {
+		return state
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	state := db.snapshotReadStateLocked()
+	db.readState.Store(state)
+	return state
+}
+
+func (db *DB) publishReadState() {
+	db.mu.Lock()
+	db.publishReadStateLocked()
+	db.mu.Unlock()
+}
+
+func (db *DB) publishReadStateLocked() {
+	db.readState.Store(db.snapshotReadStateLocked())
+}
+
+func (db *DB) snapshotReadStateLocked() *dbReadState {
+	state := &dbReadState{
+		closed:   db.closed,
+		memtable: db.memtable,
+		valueLog: db.valueLog,
+	}
+	if len(db.immutable) > 0 {
+		state.immutable = append([]*immutableMemtable(nil), db.immutable...)
+	}
+	if len(db.sstables) > 0 {
+		state.sstables = append([]*sstable.Table(nil), db.sstables...)
+	}
+	return state
 }
