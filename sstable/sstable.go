@@ -569,6 +569,14 @@ type Table struct {
 	blockCache *dataBlockCache
 }
 
+type Iterator struct {
+	table    *Table
+	rangeIdx int
+	entryIdx int
+	block    *cachedDataBlock
+	err      error
+}
+
 func (s *Table) Get(key []byte) ([]byte, error) {
 	if s.filter != nil && !s.filter.Contains(key) {
 		return nil, nil
@@ -617,6 +625,80 @@ func (s *Table) Close() error {
 		s.blockCache.clear()
 	}
 	return s.f.Close()
+}
+
+func (s *Table) NewIterator() *Iterator {
+	return &Iterator{table: s, rangeIdx: -1, entryIdx: -1}
+}
+
+func (it *Iterator) Rewind() {
+	if it == nil {
+		return
+	}
+	it.err = nil
+	it.rangeIdx = 0
+	it.entryIdx = 0
+	it.block = nil
+	it.loadCurrent()
+}
+
+func (it *Iterator) Valid() bool {
+	return it != nil && it.err == nil && it.block != nil && it.rangeIdx >= 0 && it.rangeIdx < len(it.table.idx.ranges) && it.entryIdx >= 0 && it.entryIdx < len(it.block.entryOffsets)
+}
+
+func (it *Iterator) Key() []byte {
+	if !it.Valid() {
+		return nil
+	}
+	key, _ := it.block.entryAt(it.entryIdx)
+	return key
+}
+
+func (it *Iterator) Value() []byte {
+	if !it.Valid() {
+		return nil
+	}
+	_, value := it.block.entryAt(it.entryIdx)
+	return value
+}
+
+func (it *Iterator) Next() {
+	if !it.Valid() {
+		return
+	}
+	it.entryIdx++
+	it.loadCurrent()
+}
+
+func (it *Iterator) Err() error {
+	if it == nil {
+		return nil
+	}
+	return it.err
+}
+
+func (it *Iterator) loadCurrent() {
+	if it == nil || it.err != nil || it.table == nil {
+		return
+	}
+	for it.rangeIdx >= 0 && it.rangeIdx < len(it.table.idx.ranges) {
+		if it.block == nil {
+			block, err := it.table.getCachedBlock(&it.table.idx.ranges[it.rangeIdx])
+			if err != nil {
+				it.err = err
+				it.block = nil
+				return
+			}
+			it.block = block
+		}
+		if it.entryIdx < len(it.block.entryOffsets) {
+			return
+		}
+		it.rangeIdx++
+		it.entryIdx = 0
+		it.block = nil
+	}
+	it.block = nil
 }
 
 func (s *Table) getCachedBlock(ra *dataRange) (*cachedDataBlock, error) {
