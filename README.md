@@ -11,3 +11,7 @@ Current comparison results are in `bloom/BENCHMARKS.md`.
 ### DB Engine Comparison
 
 `benchmarks/dbcompare` contains a separate benchmark module for comparing `seol` against `goleveldb` over single-threaded and multi-threaded `Put`, `Get`, and `Open` workloads.
+
+### Local Baselines
+
+Current local baseline results for core structures and the compaction path are in `BENCHMARKS.md`.
