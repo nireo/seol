@@ -209,6 +209,110 @@ func TestDBDefaultThresholdOffloadsFourKiBValues(t *testing.T) {
 	}
 }
 
+func TestDBDeleteHidesMemtableValueImmediately(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 128}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	key := []byte("alpha")
+	value := bytes.Repeat([]byte{'x'}, 512)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+	if err := db.Delete(key); err != nil {
+		t.Fatalf("delete alpha: %v", err)
+	}
+
+	if got, err := db.Get(key); err != nil || got != nil {
+		if err != nil {
+			t.Fatalf("get alpha after delete: %v", err)
+		}
+		t.Fatalf("get alpha after delete: got %q, want nil", got)
+	}
+
+	stored := db.memtable.Get(key)
+	if !isTombstoneValue(stored) {
+		t.Fatalf("memtable stored value after delete is not a tombstone")
+	}
+}
+
+func TestDBDeleteShadowsOlderSSTValueAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 128, ValueThreshold: 128}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	key := []byte("shared")
+	value := bytes.Repeat([]byte{'o'}, 512)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put shared: %v", err)
+	}
+	waitForDBState(t, db, func(db *DB) bool {
+		return len(db.sstables) == 1
+	})
+
+	if err := db.Delete(key); err != nil {
+		t.Fatalf("delete shared: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	reopened, err := OpenWithOptions(dir, Options{ValueThreshold: 128})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	if got, err := reopened.Get(key); err != nil || got != nil {
+		if err != nil {
+			t.Fatalf("get shared after reopen: %v", err)
+		}
+		t.Fatalf("get shared after reopen: got %q, want nil", got)
+	}
+}
+
+func TestDBDeleteSurvivesWALReplay(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 128}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	key := []byte("alpha")
+	value := bytes.Repeat([]byte{'x'}, 512)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+	if err := db.Delete(key); err != nil {
+		t.Fatalf("delete alpha: %v", err)
+	}
+
+	stopDBWithoutFlush(t, db)
+
+	reopened, err := OpenWithOptions(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 128})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	if got, err := reopened.Get(key); err != nil || got != nil {
+		if err != nil {
+			t.Fatalf("get alpha after WAL replay: %v", err)
+		}
+		t.Fatalf("get alpha after WAL replay: got %q, want nil", got)
+	}
+
+	stored := reopened.memtable.Get(key)
+	if !isTombstoneValue(stored) {
+		t.Fatalf("replayed memtable value is not a tombstone")
+	}
+}
+
 func TestDBReplaysSmallValuesInlineFromWAL(t *testing.T) {
 	dir := t.TempDir()
 	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 64}, sstable.Flush)

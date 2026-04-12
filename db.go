@@ -290,6 +290,14 @@ func memtableArenaSize(maxBytes int64) int64 {
 }
 
 func (db *DB) Put(key, value []byte) error {
+	return db.submitWrite(key, value)
+}
+
+func (db *DB) Delete(key []byte) error {
+	return db.submitWrite(key, tombstoneValue)
+}
+
+func (db *DB) submitWrite(key, value []byte) error {
 	req := acquireWriteRequest(key, value)
 
 	if !db.beginSubmit() {
@@ -320,12 +328,12 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 	if state.memtable != nil {
 		if stored := state.memtable.Get(key); stored != nil {
-			return resolveStoredValue(state.valueLog, stored)
+			return readStoredValue(state.valueLog, stored)
 		}
 	}
 	for i := len(state.immutable) - 1; i >= 0; i-- {
 		if stored := state.immutable[i].table.Get(key); stored != nil {
-			return resolveStoredValue(state.valueLog, stored)
+			return readStoredValue(state.valueLog, stored)
 		}
 	}
 	for _, sst := range state.sstables {
@@ -334,11 +342,22 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 			return nil, err
 		}
 		if stored != nil {
-			return resolveStoredValue(state.valueLog, stored)
+			return readStoredValue(state.valueLog, stored)
 		}
 	}
 
 	return nil, nil
+}
+
+func readStoredValue(valueLog *vlog.Log, stored []byte) ([]byte, error) {
+	value, deleted, err := resolveStoredValue(valueLog, stored)
+	if err != nil {
+		return nil, err
+	}
+	if deleted {
+		return nil, nil
+	}
+	return value, nil
 }
 
 func (db *DB) Close() error {

@@ -9,6 +9,7 @@ import (
 )
 
 var valueRefPrefix = []byte{0x00, 's', 'e', 'o', 'l', 'v', 'r', 0x01}
+var tombstoneValue = []byte{0x00, 's', 'e', 'o', 'l', 't', 'o', 'm', 'b', 0x01}
 
 const compactEncodedValueRefSize = 8 + 4 + 4 + 4
 const maxCompactValueRefOffset = uint64(^uint32(0))
@@ -66,7 +67,18 @@ func memtableEntrySize(key, value []byte) int64 {
 	return int64(len(key) + len(value))
 }
 
+func encodeTombstone() []byte {
+	return append([]byte(nil), tombstoneValue...)
+}
+
+func isTombstoneValue(data []byte) bool {
+	return bytes.Equal(data, tombstoneValue)
+}
+
 func storeValueForLSM(valueLog *vlog.Log, valueThreshold int, key, value []byte) ([]byte, error) {
+	if isTombstoneValue(value) {
+		return encodeTombstone(), nil
+	}
 	if len(value) <= valueThreshold {
 		return value, nil
 	}
@@ -81,21 +93,25 @@ func storeValueForLSM(valueLog *vlog.Log, valueThreshold int, key, value []byte)
 	return encodeValueRef(ref), nil
 }
 
-func resolveStoredValue(valueLog *vlog.Log, stored []byte) ([]byte, error) {
+func resolveStoredValue(valueLog *vlog.Log, stored []byte) ([]byte, bool, error) {
+	if isTombstoneValue(stored) {
+		return nil, true, nil
+	}
+
 	ref, ok, err := decodeValueRef(stored)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !ok {
-		return stored, nil
+		return stored, false, nil
 	}
 	if valueLog == nil {
-		return nil, fmt.Errorf("seol: value log is nil")
+		return nil, false, fmt.Errorf("seol: value log is nil")
 	}
 
 	value, err := valueLog.Read(ref)
 	if err != nil {
-		return nil, fmt.Errorf("seol: read value log: %w", err)
+		return nil, false, fmt.Errorf("seol: read value log: %w", err)
 	}
-	return value, nil
+	return value, false, nil
 }

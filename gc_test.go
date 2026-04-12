@@ -135,6 +135,60 @@ func TestDBRunValueLogGCPreservesInlineAndVlogValues(t *testing.T) {
 	}
 }
 
+func TestDBRunValueLogGCDropsTombstonedKeys(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MemtableMaxBytes: 128, ValueThreshold: 128}
+	db, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+
+	deletedKey := []byte("deleted")
+	liveKey := []byte("live")
+	if err := db.Put(deletedKey, gcTestValue(0, 0, 512)); err != nil {
+		t.Fatalf("put deleted: %v", err)
+	}
+	if err := db.Put(liveKey, gcTestValue(0, 1, 512)); err != nil {
+		t.Fatalf("put live: %v", err)
+	}
+	waitForDBState(t, db, func(db *DB) bool {
+		return len(db.sstables) >= 1
+	})
+
+	if err := db.Delete(deletedKey); err != nil {
+		t.Fatalf("delete key: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db before gc: %v", err)
+	}
+
+	reopened, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatalf("reopen before gc: %v", err)
+	}
+	gcDB, err := reopened.RunValueLogGC()
+	if err != nil {
+		t.Fatalf("RunValueLogGC: %v", err)
+	}
+	defer func() { _ = gcDB.Close() }()
+
+	if got, err := gcDB.Get(deletedKey); err != nil || got != nil {
+		if err != nil {
+			t.Fatalf("get deleted key after gc: %v", err)
+		}
+		t.Fatalf("get deleted key after gc: got %q, want nil", got)
+	}
+	if got, err := gcDB.Get(liveKey); err != nil || got == nil {
+		if err != nil {
+			t.Fatalf("get live key after gc: %v", err)
+		}
+		t.Fatalf("get live key after gc: got nil, want value")
+	}
+	if gcKeyPresentInSSTs(t, gcDB, deletedKey) {
+		t.Fatalf("deleted key still present in rewritten sstables")
+	}
+}
+
 type gcFileUsage struct {
 	total int64
 	vlog  int64
@@ -188,6 +242,24 @@ func gcStoredValueFromSSTs(t *testing.T, db *DB, key []byte) []byte {
 	}
 	t.Fatalf("key %q not found in sstables", key)
 	return nil
+}
+
+func gcKeyPresentInSSTs(t *testing.T, db *DB, key []byte) bool {
+	t.Helper()
+
+	db.mu.RLock()
+	sstables := append([]*sstable.Table(nil), db.sstables...)
+	db.mu.RUnlock()
+	for _, table := range sstables {
+		stored, err := table.Get(key)
+		if err != nil {
+			t.Fatalf("sstable get %q: %v", key, err)
+		}
+		if stored != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func gcTestValue(round, index, size int) []byte {

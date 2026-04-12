@@ -132,9 +132,12 @@ func rebuildLiveState(tempDir string, sstables []*sstable.Table, oldVlog, newVlo
 			}
 			seen[keyStr] = struct{}{}
 
-			value, err := resolveStoredValue(oldVlog, stored)
+			value, deleted, err := resolveStoredValue(oldVlog, stored)
 			if err != nil {
 				return err
+			}
+			if deleted {
+				return nil
 			}
 			rewritten, err := storeValueForLSM(newVlog, opts.ValueThreshold, key, value)
 			if err != nil {
