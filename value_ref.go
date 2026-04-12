@@ -10,7 +10,20 @@ import (
 
 var valueRefPrefix = []byte{0x00, 's', 'e', 'o', 'l', 'v', 'r', 0x01}
 
+const compactEncodedValueRefSize = 8 + 4 + 4 + 4
+const maxCompactValueRefOffset = uint64(^uint32(0))
+
 func encodeValueRef(ref vlog.ValueRef) []byte {
+	if ref.Offset <= maxCompactValueRefOffset {
+		buf := make([]byte, len(valueRefPrefix)+compactEncodedValueRefSize)
+		copy(buf, valueRefPrefix)
+		binary.LittleEndian.PutUint64(buf[len(valueRefPrefix):], ref.SegmentID)
+		binary.LittleEndian.PutUint32(buf[len(valueRefPrefix)+8:], uint32(ref.Offset))
+		binary.LittleEndian.PutUint32(buf[len(valueRefPrefix)+12:], ref.ValueLen)
+		binary.LittleEndian.PutUint32(buf[len(valueRefPrefix)+16:], ref.Checksum)
+		return buf
+	}
+
 	buf := make([]byte, len(valueRefPrefix)+vlog.EncodedValueRefSize)
 	copy(buf, valueRefPrefix)
 	binary.LittleEndian.PutUint64(buf[len(valueRefPrefix):], ref.SegmentID)
@@ -21,20 +34,32 @@ func encodeValueRef(ref vlog.ValueRef) []byte {
 }
 
 func decodeValueRef(data []byte) (vlog.ValueRef, bool, error) {
-	if len(data) != len(valueRefPrefix)+vlog.EncodedValueRefSize {
+	if len(data) != len(valueRefPrefix)+compactEncodedValueRefSize && len(data) != len(valueRefPrefix)+vlog.EncodedValueRefSize {
 		return vlog.ValueRef{}, false, nil
 	}
 	if !bytes.Equal(data[:len(valueRefPrefix)], valueRefPrefix) {
 		return vlog.ValueRef{}, false, nil
 	}
+	payload := data[len(valueRefPrefix):]
 
-	ref := vlog.ValueRef{
-		SegmentID: binary.LittleEndian.Uint64(data[len(valueRefPrefix):]),
-		Offset:    binary.LittleEndian.Uint64(data[len(valueRefPrefix)+8:]),
-		ValueLen:  binary.LittleEndian.Uint32(data[len(valueRefPrefix)+16:]),
-		Checksum:  binary.LittleEndian.Uint32(data[len(valueRefPrefix)+20:]),
+	switch len(payload) {
+	case compactEncodedValueRefSize:
+		return vlog.ValueRef{
+			SegmentID: binary.LittleEndian.Uint64(payload),
+			Offset:    uint64(binary.LittleEndian.Uint32(payload[8:])),
+			ValueLen:  binary.LittleEndian.Uint32(payload[12:]),
+			Checksum:  binary.LittleEndian.Uint32(payload[16:]),
+		}, true, nil
+	case vlog.EncodedValueRefSize:
+		return vlog.ValueRef{
+			SegmentID: binary.LittleEndian.Uint64(payload),
+			Offset:    binary.LittleEndian.Uint64(payload[8:]),
+			ValueLen:  binary.LittleEndian.Uint32(payload[16:]),
+			Checksum:  binary.LittleEndian.Uint32(payload[20:]),
+		}, true, nil
+	default:
+		return vlog.ValueRef{}, false, nil
 	}
-	return ref, true, nil
 }
 
 func memtableEntrySize(key, value []byte) int64 {

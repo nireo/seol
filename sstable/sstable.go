@@ -590,6 +590,28 @@ func (s *Table) Get(key []byte) ([]byte, error) {
 	return append([]byte(nil), value...), nil
 }
 
+func (s *Table) Scan(fn func(key, value []byte) error) error {
+	if fn == nil {
+		return nil
+	}
+
+	for i := range s.idx.ranges {
+		ra := &s.idx.ranges[i]
+		block, err := s.getCachedBlock(ra)
+		if err != nil {
+			return err
+		}
+		for entryIdx := range block.entryOffsets {
+			key, value := block.entryAt(entryIdx)
+			if err := fn(key, value); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (s *Table) Close() error {
 	if s.blockCache != nil {
 		s.blockCache.clear()

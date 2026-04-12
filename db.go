@@ -83,26 +83,27 @@ type dbReadState struct {
 }
 
 type DB struct {
-	dir              string
-	memtableMaxBytes int64
-	walSyncInterval  time.Duration
-	valueThreshold   int
-	asyncWrites      bool
-	writeBatchWindow time.Duration
-	memtable         *skiplist.Skiplist
-	memtableBytes    int64
-	activeWal        *wal
-	currentWalPaths  []string
-	immutable        []*immutableMemtable
-	sstables         []*sstable.Table // newest first
-	valueLog         *vlog.Log
-	flushFn          func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)
-	writeCh          chan *writeRequest
-	flushCh          chan *immutableMemtable
-	readState        atomic.Pointer[dbReadState]
-	submitCond       *sync.Cond
-	submitters       atomic.Int64
-	commitWg         sync.WaitGroup
+	dir                     string
+	memtableMaxBytes        int64
+	walSyncInterval         time.Duration
+	valueLogSegmentMaxBytes int64
+	valueThreshold          int
+	asyncWrites             bool
+	writeBatchWindow        time.Duration
+	memtable                *skiplist.Skiplist
+	memtableBytes           int64
+	activeWal               *wal
+	currentWalPaths         []string
+	immutable               []*immutableMemtable
+	sstables                []*sstable.Table // newest first
+	valueLog                *vlog.Log
+	flushFn                 func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)
+	writeCh                 chan *writeRequest
+	flushCh                 chan *immutableMemtable
+	readState               atomic.Pointer[dbReadState]
+	submitCond              *sync.Cond
+	submitters              atomic.Int64
+	commitWg                sync.WaitGroup
 
 	mu       sync.RWMutex
 	submitMu sync.Mutex
@@ -253,21 +254,22 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 	currentWalPaths := append([]string(nil), walPaths...)
 	currentWalPaths = append(currentWalPaths, activeWal.path)
 	db := &DB{
-		dir:              dir,
-		memtableMaxBytes: opts.MemtableMaxBytes,
-		walSyncInterval:  opts.WALSyncInterval,
-		valueThreshold:   opts.ValueThreshold,
-		asyncWrites:      opts.AsyncWrites,
-		writeBatchWindow: opts.WriteBatchWindow,
-		memtable:         memtable,
-		memtableBytes:    memtableBytes,
-		activeWal:        activeWal,
-		currentWalPaths:  currentWalPaths,
-		sstables:         sstables,
-		valueLog:         valueLog,
-		flushFn:          flushFn,
-		writeCh:          make(chan *writeRequest, 256),
-		flushCh:          make(chan *immutableMemtable, 1),
+		dir:                     dir,
+		memtableMaxBytes:        opts.MemtableMaxBytes,
+		walSyncInterval:         opts.WALSyncInterval,
+		valueLogSegmentMaxBytes: opts.ValueLogSegmentMaxBytes,
+		valueThreshold:          opts.ValueThreshold,
+		asyncWrites:             opts.AsyncWrites,
+		writeBatchWindow:        opts.WriteBatchWindow,
+		memtable:                memtable,
+		memtableBytes:           memtableBytes,
+		activeWal:               activeWal,
+		currentWalPaths:         currentWalPaths,
+		sstables:                sstables,
+		valueLog:                valueLog,
+		flushFn:                 flushFn,
+		writeCh:                 make(chan *writeRequest, 256),
+		flushCh:                 make(chan *immutableMemtable, 1),
 	}
 	db.submitCond = sync.NewCond(&db.submitMu)
 	db.publishReadState()
