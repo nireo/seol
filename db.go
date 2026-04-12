@@ -19,7 +19,7 @@ import (
 const (
 	defaultMemtableMaxBytes int64 = 4 << 20
 	minMemtableArenaSize    int64 = 1 << 20
-	defaultValueThreshold         = 128
+	defaultValueThreshold         = 2 << 10
 	defaultWriteBatchWindow       = 100 * time.Microsecond
 )
 

@@ -157,6 +157,58 @@ func TestDBStoresSmallValuesInline(t *testing.T) {
 	}
 }
 
+func TestDBDefaultThresholdKeepsTwoKiBValuesInline(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	key := []byte("alpha")
+	value := bytes.Repeat([]byte{'x'}, 2<<10)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+
+	stored := db.memtable.Get(key)
+	if !bytes.Equal(stored, value) {
+		t.Fatalf("memtable stored value length: got %d, want %d", len(stored), len(value))
+	}
+	if _, ok, err := decodeValueRef(stored); err != nil || ok {
+		if err != nil {
+			t.Fatalf("decodeValueRef: %v", err)
+		}
+		t.Fatalf("2 KiB value should stay inline with default threshold")
+	}
+}
+
+func TestDBDefaultThresholdOffloadsFourKiBValues(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	key := []byte("alpha")
+	value := bytes.Repeat([]byte{'x'}, 4<<10)
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("put alpha: %v", err)
+	}
+
+	stored := db.memtable.Get(key)
+	if bytes.Equal(stored, value) {
+		t.Fatalf("memtable stored inline value, expected encoded reference")
+	}
+	if _, ok, err := decodeValueRef(stored); err != nil || !ok {
+		if err != nil {
+			t.Fatalf("decodeValueRef: %v", err)
+		}
+		t.Fatalf("4 KiB value should be stored as a value reference with default threshold")
+	}
+}
+
 func TestDBReplaysSmallValuesInlineFromWAL(t *testing.T) {
 	dir := t.TempDir()
 	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 64}, sstable.Flush)
