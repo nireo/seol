@@ -493,6 +493,7 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 		idx:        tableIndex{},
 		f:          file,
 		blockCache: newDataBlockCache(blockCacheEntryLimit),
+		path:       path,
 	}
 
 	filter, bloomSize, err := prepareBloomFilter(file, sk)
@@ -521,6 +522,9 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 		return nil, err
 	}
 	if _, err := file.WriteAt(filterData, 0); err != nil {
+		return nil, err
+	}
+	if err := sst.loadMetadata(); err != nil {
 		return nil, err
 	}
 
@@ -556,8 +560,11 @@ func Open(path string) (*Table, error) {
 		return nil, err
 	}
 
-	sst := &Table{f: file, filter: filter, blockCache: newDataBlockCache(blockCacheEntryLimit)}
+	sst := &Table{f: file, filter: filter, blockCache: newDataBlockCache(blockCacheEntryLimit), path: path}
 	sst.idx.decodeFullRange(indexData)
+	if err := sst.loadMetadata(); err != nil {
+		return nil, err
+	}
 	cleanup = false
 	return sst, nil
 }
@@ -567,6 +574,17 @@ type Table struct {
 	filter     *bloom.Filter
 	f          *os.File
 	blockCache *dataBlockCache
+	path       string
+	smallest   []byte
+	largest    []byte
+	sizeBytes  int64
+}
+
+type Metadata struct {
+	Path      string
+	Smallest  []byte
+	Largest   []byte
+	SizeBytes int64
 }
 
 type Iterator struct {
@@ -618,6 +636,18 @@ func (s *Table) Scan(fn func(key, value []byte) error) error {
 	}
 
 	return nil
+}
+
+func (s *Table) Metadata() Metadata {
+	if s == nil {
+		return Metadata{}
+	}
+	return Metadata{
+		Path:      s.path,
+		Smallest:  append([]byte(nil), s.smallest...),
+		Largest:   append([]byte(nil), s.largest...),
+		SizeBytes: s.sizeBytes,
+	}
 }
 
 func (s *Table) Close() error {
@@ -718,4 +748,33 @@ func (s *Table) getCachedBlock(ra *dataRange) (*cachedDataBlock, error) {
 	}
 	s.blockCache.add(ra.offset, block)
 	return block, nil
+}
+
+func (s *Table) loadMetadata() error {
+	if s == nil || s.f == nil {
+		return nil
+	}
+	stat, err := s.f.Stat()
+	if err != nil {
+		return err
+	}
+	s.sizeBytes = stat.Size()
+	if len(s.idx.ranges) == 0 {
+		s.smallest = nil
+		s.largest = nil
+		return nil
+	}
+	s.smallest = append(s.smallest[:0], s.idx.ranges[0].firstKey...)
+	lastRange := &s.idx.ranges[len(s.idx.ranges)-1]
+	block, err := s.getCachedBlock(lastRange)
+	if err != nil {
+		return err
+	}
+	if len(block.entryOffsets) == 0 {
+		s.largest = nil
+		return nil
+	}
+	lastKey, _ := block.entryAt(len(block.entryOffsets) - 1)
+	s.largest = append(s.largest[:0], lastKey...)
+	return nil
 }

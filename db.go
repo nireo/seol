@@ -96,6 +96,8 @@ type DB struct {
 	currentWalPaths         []string
 	immutable               []*immutableMemtable
 	sstables                []*sstable.Table // newest first
+	tableMeta               []TableMeta
+	manifest                *manifestStore
 	valueLog                *vlog.Log
 	flushFn                 func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)
 	writeCh                 chan *writeRequest
@@ -181,6 +183,14 @@ func openSSTables(paths []string) ([]*sstable.Table, error) {
 	return sstables, nil
 }
 
+func openSSTablesFromMeta(dir string, tables []TableMeta) ([]*sstable.Table, error) {
+	paths := make([]string, 0, len(tables))
+	for _, table := range tables {
+		paths = append(paths, filepath.Join(dir, table.Filename))
+	}
+	return openSSTables(paths)
+}
+
 func closeSSTables(sstables []*sstable.Table) {
 	for _, sst := range sstables {
 		_ = sst.Close()
@@ -222,12 +232,17 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 		return nil, err
 	}
 
-	sstPaths, walPaths, err := scanDataFiles(dir)
+	_, walPaths, err := scanDataFiles(dir)
 	if err != nil {
 		return nil, err
 	}
+	manifest, err := openManifest(dir)
+	if err != nil {
+		return nil, err
+	}
+	tableMeta := manifest.Tables()
 
-	sstables, err := openSSTables(sstPaths)
+	sstables, err := openSSTablesFromMeta(dir, tableMeta)
 	if err != nil {
 		return nil, err
 	}
@@ -266,6 +281,8 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 		activeWal:               activeWal,
 		currentWalPaths:         currentWalPaths,
 		sstables:                sstables,
+		tableMeta:               tableMeta,
+		manifest:                manifest,
 		valueLog:                valueLog,
 		flushFn:                 flushFn,
 		writeCh:                 make(chan *writeRequest, 256),
@@ -651,7 +668,10 @@ func (db *DB) flushLoop() {
 			continue
 		}
 
-		db.installFlushedTable(imm, sst)
+		if err := db.installFlushedTable(imm, sst); err != nil {
+			db.setFlushErrIfNil(err)
+			continue
+		}
 		if err := removeWALFiles(imm.walPaths); err != nil {
 			db.setFlushErrIfNil(err)
 		}
@@ -665,7 +685,7 @@ func (db *DB) syncValueLogForFlush() error {
 	return nil
 }
 
-func (db *DB) installFlushedTable(imm *immutableMemtable, sst *sstable.Table) {
+func (db *DB) installFlushedTable(imm *immutableMemtable, sst *sstable.Table) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -676,8 +696,16 @@ func (db *DB) installFlushedTable(imm *immutableMemtable, sst *sstable.Table) {
 		db.immutable = append(db.immutable[:i], db.immutable[i+1:]...)
 		break
 	}
+
+	updatedMeta := append([]TableMeta{tableMetaFromSST(sst.Metadata(), 0)}, db.tableMeta...)
+	if err := db.manifest.ReplaceTables(updatedMeta); err != nil {
+		return fmt.Errorf("seol: update manifest after flush: %w", err)
+	}
+
 	db.sstables = append([]*sstable.Table{sst}, db.sstables...)
+	db.tableMeta = updatedMeta
 	db.publishReadStateLocked()
+	return nil
 }
 
 func removeWALFiles(paths []string) error {

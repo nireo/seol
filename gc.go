@@ -199,6 +199,9 @@ func replaceRewrittenFiles(dir, tempDir string) error {
 			return fmt.Errorf("seol: remove old data file %s: %w", base, removeErr)
 		}
 	}
+	if err := rebuildManifestFromDisk(dir); err != nil {
+		return err
+	}
 
 	return os.RemoveAll(tempDir)
 }

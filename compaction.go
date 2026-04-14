@@ -180,6 +180,9 @@ func replaceCompactedTables(dir string, inputPaths []string, tempDir string) err
 			return fmt.Errorf("seol: remove compacted table %s: %w", base, err)
 		}
 	}
+	if err := rebuildManifestFromDisk(dir); err != nil {
+		return err
+	}
 	return os.RemoveAll(tempDir)
 }
 
