@@ -189,6 +189,54 @@ func TestDBRunValueLogGCDropsTombstonedKeys(t *testing.T) {
 	}
 }
 
+func TestDBRunValueLogGCPreservesManifestLevels(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 128}
+	db, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+
+	if err := db.Put([]byte("shared"), gcTestValue(0, 0, 512)); err != nil {
+		t.Fatalf("put shared old: %v", err)
+	}
+	if err := db.rotateMemtable(); err != nil {
+		t.Fatalf("rotateMemtable old run: %v", err)
+	}
+	waitForDBState(t, db, func(db *DB) bool {
+		return len(db.sstables) == 1
+	})
+
+	if err := db.Put([]byte("shared"), gcTestValue(1, 0, 512)); err != nil {
+		t.Fatalf("put shared new: %v", err)
+	}
+	compactDB, err := db.Compact()
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	if len(compactDB.levels) != 1 || compactDB.levels[0].level != 1 {
+		t.Fatalf("levels after compact: got %+v, want single L1", compactDB.levels)
+	}
+
+	gcDB, err := compactDB.RunValueLogGC()
+	if err != nil {
+		t.Fatalf("RunValueLogGC: %v", err)
+	}
+	defer func() { _ = gcDB.Close() }()
+
+	state := readManifestState(t, dir)
+	if len(state.Tables) != 1 {
+		t.Fatalf("manifest table count after gc: got %d, want 1", len(state.Tables))
+	}
+	if state.Tables[0].Level != 1 {
+		t.Fatalf("manifest level after gc: got %d, want 1", state.Tables[0].Level)
+	}
+	if len(gcDB.levels) != 1 || gcDB.levels[0].level != 1 || len(gcDB.levels[0].tables) != 1 {
+		t.Fatalf("levels after gc: got %+v, want single L1", gcDB.levels)
+	}
+}
+
 type gcFileUsage struct {
 	total int64
 	vlog  int64

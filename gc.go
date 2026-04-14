@@ -43,16 +43,21 @@ func rewriteValueLogFiles(dir string, opts Options, flushFn func(baseDir string,
 	if flushFn == nil {
 		flushFn = sstable.Flush
 	}
-
-	sstPaths, _, err := scanDataFiles(dir)
+	manifest, err := openManifest(dir)
 	if err != nil {
 		return err
 	}
-	oldSSTs, err := openSSTables(sstPaths)
+	tableMeta := manifest.Tables()
+
+	oldSSTs, err := openSSTablesFromMeta(dir, tableMeta)
 	if err != nil {
 		return err
 	}
 	defer func() { closeSSTables(oldSSTs) }()
+	levels, _, _, err := buildLevelState(tableMeta, oldSSTs)
+	if err != nil {
+		return err
+	}
 
 	oldVlog, err := vlog.Open(dir, vlog.Options{SegmentMaxBytes: opts.ValueLogSegmentMaxBytes})
 	if err != nil {
@@ -80,7 +85,7 @@ func rewriteValueLogFiles(dir string, opts Options, flushFn func(baseDir string,
 		return err
 	}
 
-	newSSTs, err := rebuildLiveState(tempDir, oldSSTs, oldVlog, newVlog, opts, flushFn)
+	newSSTs, newMeta, err := rebuildLiveState(tempDir, levels, oldVlog, newVlog, opts, flushFn)
 	if err != nil {
 		_ = newVlog.Close()
 		closeSSTables(newSSTs)
@@ -97,76 +102,79 @@ func rewriteValueLogFiles(dir string, opts Options, flushFn func(baseDir string,
 	closeSSTables(oldSSTs)
 	oldSSTs = nil
 
-	if err := replaceRewrittenFiles(dir, tempDir); err != nil {
+	if err := replaceRewrittenFiles(dir, manifest, tableMeta, newMeta, tempDir); err != nil {
 		return err
 	}
 	cleanupTempDir = false
 	return nil
 }
 
-func rebuildLiveState(tempDir string, sstables []*sstable.Table, oldVlog, newVlog *vlog.Log, opts Options, flushFn func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)) ([]*sstable.Table, error) {
+func rebuildLiveState(tempDir string, levels []tableLevelState, oldVlog, newVlog *vlog.Log, opts Options, flushFn func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)) ([]*sstable.Table, []TableMeta, error) {
 	seen := make(map[string]struct{})
-	builder := skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
-	builderBytes := int64(0)
-	flushed := make([]*sstable.Table, 0, len(sstables))
+	flushed := make([]*sstable.Table, 0)
+	flushedMeta := make([]TableMeta, 0)
 
-	flushBuilder := func() error {
-		if builder.Empty() {
-			return nil
-		}
-		sst, err := flushFn(tempDir, builder)
-		if err != nil {
-			return err
-		}
-		flushed = append(flushed, sst)
-		builder = skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
-		builderBytes = 0
-		return nil
-	}
-
-	for _, table := range sstables {
-		if err := table.Scan(func(key, stored []byte) error {
-			keyStr := string(key)
-			if _, ok := seen[keyStr]; ok {
+	for _, level := range levels {
+		for i, table := range level.tables {
+			sourceMeta := level.meta[i]
+			builder := skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
+			builderBytes := int64(0)
+			flushBuilder := func() error {
+				if builder.Empty() {
+					return nil
+				}
+				sst, err := flushFn(tempDir, builder)
+				if err != nil {
+					return err
+				}
+				meta := tableMetaFromSST(sst.Metadata(), sourceMeta.Level)
+				meta.CreatedAt = sourceMeta.CreatedAt
+				flushed = append(flushed, sst)
+				flushedMeta = append(flushedMeta, meta)
+				builder = skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
+				builderBytes = 0
 				return nil
 			}
-			seen[keyStr] = struct{}{}
 
-			value, deleted, err := resolveStoredValue(oldVlog, stored)
-			if err != nil {
-				return err
+			if err := table.Scan(func(key, stored []byte) error {
+				keyStr := string(key)
+				if _, ok := seen[keyStr]; ok {
+					return nil
+				}
+				seen[keyStr] = struct{}{}
+
+				value, deleted, err := resolveStoredValue(oldVlog, stored)
+				if err != nil {
+					return err
+				}
+				if deleted {
+					return nil
+				}
+				rewritten, err := storeValueForLSM(newVlog, opts.ValueThreshold, key, value)
+				if err != nil {
+					return err
+				}
+				builder.Put(key, rewritten)
+				builderBytes += memtableEntrySize(key, value)
+				if builderBytes < opts.MemtableMaxBytes {
+					return nil
+				}
+				return flushBuilder()
+			}); err != nil {
+				closeSSTables(flushed)
+				return nil, nil, err
 			}
-			if deleted {
-				return nil
+			if err := flushBuilder(); err != nil {
+				closeSSTables(flushed)
+				return nil, nil, err
 			}
-			rewritten, err := storeValueForLSM(newVlog, opts.ValueThreshold, key, value)
-			if err != nil {
-				return err
-			}
-			builder.Put(key, rewritten)
-			builderBytes += memtableEntrySize(key, value)
-			if builderBytes < opts.MemtableMaxBytes {
-				return nil
-			}
-			return flushBuilder()
-		}); err != nil {
-			closeSSTables(flushed)
-			return nil, err
 		}
 	}
 
-	if err := flushBuilder(); err != nil {
-		closeSSTables(flushed)
-		return nil, err
-	}
-	return flushed, nil
+	return flushed, flushedMeta, nil
 }
 
-func replaceRewrittenFiles(dir, tempDir string) error {
-	oldSSTPaths, _, err := scanDataFiles(dir)
-	if err != nil {
-		return err
-	}
+func replaceRewrittenFiles(dir string, manifest *manifestStore, oldTables, newTables []TableMeta, tempDir string) error {
 	oldVlogPaths, err := scanValueLogPaths(dir)
 	if err != nil {
 		return err
@@ -190,7 +198,16 @@ func replaceRewrittenFiles(dir, tempDir string) error {
 			return err
 		}
 	}
-	for _, path := range append(oldSSTPaths, oldVlogPaths...) {
+	for _, table := range oldTables {
+		base := table.Filename
+		if _, ok := newNames[base]; ok {
+			continue
+		}
+		if removeErr := os.Remove(filepath.Join(dir, base)); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("seol: remove old data file %s: %w", base, removeErr)
+		}
+	}
+	for _, path := range oldVlogPaths {
 		base := filepath.Base(path)
 		if _, ok := newNames[base]; ok {
 			continue
@@ -199,7 +216,9 @@ func replaceRewrittenFiles(dir, tempDir string) error {
 			return fmt.Errorf("seol: remove old data file %s: %w", base, removeErr)
 		}
 	}
-	if err := rebuildManifestFromDisk(dir); err != nil {
+	updatedTables := cloneTableMeta(newTables)
+	orderTableMetaForManifest(updatedTables)
+	if err := manifest.ReplaceTables(updatedTables); err != nil {
 		return err
 	}
 
