@@ -79,6 +79,7 @@ type dbReadState struct {
 	memtable  *skiplist.Skiplist
 	immutable []*immutableMemtable
 	sstables  []*sstable.Table
+	levels    []tableLevelState
 	valueLog  *vlog.Log
 }
 
@@ -96,6 +97,7 @@ type DB struct {
 	currentWalPaths         []string
 	immutable               []*immutableMemtable
 	sstables                []*sstable.Table // newest first
+	levels                  []tableLevelState
 	tableMeta               []TableMeta
 	manifest                *manifestStore
 	valueLog                *vlog.Log
@@ -246,23 +248,28 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 	if err != nil {
 		return nil, err
 	}
+	levels, orderedMeta, flatTables, err := buildLevelState(tableMeta, sstables)
+	if err != nil {
+		closeSSTables(sstables)
+		return nil, err
+	}
 
 	valueLog, err := vlog.Open(dir, vlog.Options{SegmentMaxBytes: opts.ValueLogSegmentMaxBytes})
 	if err != nil {
-		closeSSTables(sstables)
+		closeSSTables(flatTables)
 		return nil, err
 	}
 
 	memtable := skiplist.New(memtableArenaSize(opts.MemtableMaxBytes))
 	memtableBytes, err := replayWALs(walPaths, valueLog, opts.ValueThreshold, memtable)
 	if err != nil {
-		closeOpenResources(valueLog, sstables)
+		closeOpenResources(valueLog, flatTables)
 		return nil, err
 	}
 
 	activeWal, err := createWAL(dir, opts.WALSyncInterval)
 	if err != nil {
-		closeOpenResources(valueLog, sstables)
+		closeOpenResources(valueLog, flatTables)
 		return nil, err
 	}
 
@@ -280,8 +287,9 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 		memtableBytes:           memtableBytes,
 		activeWal:               activeWal,
 		currentWalPaths:         currentWalPaths,
-		sstables:                sstables,
-		tableMeta:               tableMeta,
+		sstables:                flatTables,
+		levels:                  levels,
+		tableMeta:               orderedMeta,
 		manifest:                manifest,
 		valueLog:                valueLog,
 		flushFn:                 flushFn,
@@ -352,6 +360,9 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		if stored := state.immutable[i].table.Get(key); stored != nil {
 			return readStoredValue(state.valueLog, stored)
 		}
+	}
+	if len(state.levels) > 0 {
+		return lookupLevels(state.levels, state.valueLog, key)
 	}
 	for _, sst := range state.sstables {
 		stored, err := sst.Get(key)
@@ -701,9 +712,14 @@ func (db *DB) installFlushedTable(imm *immutableMemtable, sst *sstable.Table) er
 	if err := db.manifest.ReplaceTables(updatedMeta); err != nil {
 		return fmt.Errorf("seol: update manifest after flush: %w", err)
 	}
-
-	db.sstables = append([]*sstable.Table{sst}, db.sstables...)
-	db.tableMeta = updatedMeta
+	updatedTables := append([]*sstable.Table{sst}, db.sstables...)
+	levels, orderedMeta, flatTables, err := buildLevelState(updatedMeta, updatedTables)
+	if err != nil {
+		return err
+	}
+	db.sstables = flatTables
+	db.levels = levels
+	db.tableMeta = orderedMeta
 	db.publishReadStateLocked()
 	return nil
 }
@@ -750,6 +766,9 @@ func (db *DB) snapshotReadStateLocked() *dbReadState {
 	}
 	if len(db.sstables) > 0 {
 		state.sstables = append([]*sstable.Table(nil), db.sstables...)
+	}
+	if len(db.levels) > 0 {
+		state.levels = cloneTableLevels(db.levels)
 	}
 	return state
 }

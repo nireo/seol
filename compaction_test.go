@@ -9,7 +9,7 @@ import (
 
 func TestDBCompactMergesSSTablesAndKeepsNewestValues(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MemtableMaxBytes: 128, ValueThreshold: 128}
+	opts := Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 128}
 	db, err := OpenWithOptions(dir, opts)
 	if err != nil {
 		t.Fatalf("OpenWithOptions: %v", err)
@@ -26,8 +26,11 @@ func TestDBCompactMergesSSTablesAndKeepsNewestValues(t *testing.T) {
 	if err := db.Put([]byte("old-only"), oldOnly); err != nil {
 		t.Fatalf("put old-only: %v", err)
 	}
+	if err := db.rotateMemtable(); err != nil {
+		t.Fatalf("rotateMemtable old run: %v", err)
+	}
 	waitForDBState(t, db, func(db *DB) bool {
-		return len(db.sstables) >= 1
+		return len(db.sstables) == 1
 	})
 
 	if err := db.Put([]byte("shared"), newShared); err != nil {
@@ -72,7 +75,7 @@ func TestDBCompactMergesSSTablesAndKeepsNewestValues(t *testing.T) {
 
 func TestDBCompactDropsTombstones(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MemtableMaxBytes: 128, ValueThreshold: 128}
+	opts := Options{MemtableMaxBytes: 1 << 20, ValueThreshold: 128}
 	db, err := OpenWithOptions(dir, opts)
 	if err != nil {
 		t.Fatalf("OpenWithOptions: %v", err)
@@ -86,8 +89,11 @@ func TestDBCompactDropsTombstones(t *testing.T) {
 	if err := db.Put(liveKey, bytes.Repeat([]byte{'l'}, 512)); err != nil {
 		t.Fatalf("put live: %v", err)
 	}
+	if err := db.rotateMemtable(); err != nil {
+		t.Fatalf("rotateMemtable initial run: %v", err)
+	}
 	waitForDBState(t, db, func(db *DB) bool {
-		return len(db.sstables) >= 1
+		return len(db.sstables) == 1
 	})
 
 	if err := db.Delete(deletedKey); err != nil {

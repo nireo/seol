@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/nireo/seol/skiplist"
 	"github.com/nireo/seol/sstable"
 )
 
 type compactionPlan struct {
-	inputPaths        []string
+	sourceLevel       int
+	targetLevel       int
+	sourceTables      []TableMeta
+	targetTables      []TableMeta
 	targetOutputBytes int64
 	dropTombstones    bool
 }
@@ -20,20 +24,28 @@ type compactionPlanner interface {
 	Plan(dir string, opts Options) (*compactionPlan, error)
 }
 
-type fullCompactionPlanner struct{}
+type leveledCompactionPlanner struct{}
 
-func (fullCompactionPlanner) Plan(dir string, opts Options) (*compactionPlan, error) {
-	sstPaths, _, err := scanDataFiles(dir)
+func (leveledCompactionPlanner) Plan(dir string, opts Options) (*compactionPlan, error) {
+	manifest, err := openManifest(dir)
 	if err != nil {
 		return nil, err
 	}
-	if len(sstPaths) == 0 {
+	levels := groupTableMetaByLevel(manifest.Tables())
+	if len(levels) == 0 || len(levels[0].meta) == 0 {
 		return nil, nil
 	}
+	sourceTables := selectL0CompactionSource(levels[0].meta)
+	smallest, largest := tableMetaBounds(sourceTables)
+	targetTables := overlappingTableMeta(levels, 1, smallest, largest)
+	maxLevel := maxTableLevel(levels)
 	return &compactionPlan{
-		inputPaths:        sstPaths,
+		sourceLevel:       0,
+		targetLevel:       1,
+		sourceTables:      sourceTables,
+		targetTables:      targetTables,
 		targetOutputBytes: compactionOutputBytes(opts),
-		dropTombstones:    true,
+		dropTombstones:    maxLevel <= 1,
 	}, nil
 }
 
@@ -41,7 +53,7 @@ func (db *DB) Compact() (*DB, error) {
 	opts := db.optionsSnapshot()
 	dir := db.dir
 	flushFn := db.flushFn
-	planner := fullCompactionPlanner{}
+	planner := leveledCompactionPlanner{}
 
 	if err := db.Close(); err != nil {
 		return nil, err
@@ -64,14 +76,18 @@ func compactionOutputBytes(opts Options) int64 {
 }
 
 func executeCompactionPlan(dir string, plan *compactionPlan, flushFn func(baseDir string, sk *skiplist.Skiplist) (*sstable.Table, error)) error {
-	if plan == nil || len(plan.inputPaths) == 0 {
+	if plan == nil || len(plan.sourceTables) == 0 {
 		return nil
 	}
 	if flushFn == nil {
 		flushFn = sstable.Flush
 	}
+	manifest, err := openManifest(dir)
+	if err != nil {
+		return err
+	}
 
-	inputs, err := openSSTables(plan.inputPaths)
+	inputs, err := openSSTablesFromMeta(dir, planInputTables(plan))
 	if err != nil {
 		return err
 	}
@@ -93,11 +109,15 @@ func executeCompactionPlan(dir string, plan *compactionPlan, flushFn func(baseDi
 		closeSSTables(outputs)
 		return err
 	}
+	outputMeta := make([]TableMeta, 0, len(outputs))
+	for _, table := range outputs {
+		outputMeta = append(outputMeta, tableMetaFromSST(table.Metadata(), plan.targetLevel))
+	}
 	closeSSTables(outputs)
 	closeSSTables(inputs)
 	inputs = nil
 
-	if err := replaceCompactedTables(dir, plan.inputPaths, tempDir); err != nil {
+	if err := replaceCompactedTables(dir, manifest, plan, outputMeta, tempDir); err != nil {
 		return err
 	}
 	cleanupTempDir = false
@@ -155,7 +175,7 @@ func compactTables(tempDir string, tables []*sstable.Table, plan *compactionPlan
 	return outputs, nil
 }
 
-func replaceCompactedTables(dir string, inputPaths []string, tempDir string) error {
+func replaceCompactedTables(dir string, manifest *manifestStore, plan *compactionPlan, outputMeta []TableMeta, tempDir string) error {
 	entries, err := os.ReadDir(tempDir)
 	if err != nil {
 		return err
@@ -171,19 +191,156 @@ func replaceCompactedTables(dir string, inputPaths []string, tempDir string) err
 		}
 	}
 
-	for _, path := range inputPaths {
-		base := filepath.Base(path)
+	removeNames := make(map[string]struct{}, len(plan.sourceTables)+len(plan.targetTables))
+	for _, table := range append(cloneTableMeta(plan.sourceTables), plan.targetTables...) {
+		removeNames[table.Filename] = struct{}{}
+	}
+	for base := range removeNames {
 		if _, ok := newNames[base]; ok {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := os.Remove(filepath.Join(dir, base)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("seol: remove compacted table %s: %w", base, err)
 		}
 	}
-	if err := rebuildManifestFromDisk(dir); err != nil {
+	updatedTables := make([]TableMeta, 0, len(manifest.state.Tables)-len(removeNames)+len(outputMeta))
+	for _, table := range manifest.Tables() {
+		if _, ok := removeNames[table.Filename]; ok {
+			continue
+		}
+		updatedTables = append(updatedTables, table)
+	}
+	updatedTables = append(updatedTables, outputMeta...)
+	orderTableMetaForManifest(updatedTables)
+	if err := manifest.ReplaceTables(updatedTables); err != nil {
 		return err
 	}
 	return os.RemoveAll(tempDir)
+}
+
+func planInputTables(plan *compactionPlan) []TableMeta {
+	inputs := make([]TableMeta, 0, len(plan.sourceTables)+len(plan.targetTables))
+	inputs = append(inputs, cloneTableMeta(plan.sourceTables)...)
+	inputs = append(inputs, cloneTableMeta(plan.targetTables)...)
+	return inputs
+}
+
+func groupTableMetaByLevel(tables []TableMeta) []tableLevelState {
+	if len(tables) == 0 {
+		return nil
+	}
+	grouped := make(map[int][]TableMeta)
+	levels := make([]int, 0, len(tables))
+	seen := make(map[int]struct{})
+	for _, table := range tables {
+		grouped[table.Level] = append(grouped[table.Level], table)
+		if _, ok := seen[table.Level]; ok {
+			continue
+		}
+		seen[table.Level] = struct{}{}
+		levels = append(levels, table.Level)
+	}
+	sort.Ints(levels)
+	result := make([]tableLevelState, 0, len(levels))
+	for _, level := range levels {
+		meta := cloneTableMeta(grouped[level])
+		sortTableMetaForLevel(level, meta)
+		result = append(result, tableLevelState{level: level, meta: meta})
+	}
+	return result
+}
+
+func tableMetaBounds(tables []TableMeta) ([]byte, []byte) {
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	smallest := append([]byte(nil), tables[0].Smallest...)
+	largest := append([]byte(nil), tables[0].Largest...)
+	for _, table := range tables[1:] {
+		if bytes.Compare(table.Smallest, smallest) < 0 {
+			smallest = append(smallest[:0], table.Smallest...)
+		}
+		if bytes.Compare(table.Largest, largest) > 0 {
+			largest = append(largest[:0], table.Largest...)
+		}
+	}
+	return smallest, largest
+}
+
+func overlappingTableMeta(levels []tableLevelState, level int, smallest, largest []byte) []TableMeta {
+	for _, candidate := range levels {
+		if candidate.level != level {
+			continue
+		}
+		var overlaps []TableMeta
+		for _, table := range candidate.meta {
+			if bytes.Compare(table.Largest, smallest) < 0 || bytes.Compare(table.Smallest, largest) > 0 {
+				continue
+			}
+			overlaps = append(overlaps, table)
+		}
+		return overlaps
+	}
+	return nil
+}
+
+func maxTableLevel(levels []tableLevelState) int {
+	if len(levels) == 0 {
+		return 0
+	}
+	return levels[len(levels)-1].level
+}
+
+func selectL0CompactionSource(l0 []TableMeta) []TableMeta {
+	if len(l0) == 0 {
+		return nil
+	}
+	oldest := l0[len(l0)-1]
+	smallest := append([]byte(nil), oldest.Smallest...)
+	largest := append([]byte(nil), oldest.Largest...)
+	selected := make(map[string]struct{}, len(l0))
+	selected[oldest.Filename] = struct{}{}
+
+	changed := true
+	for changed {
+		changed = false
+		for _, table := range l0 {
+			if _, ok := selected[table.Filename]; ok {
+				continue
+			}
+			if bytes.Compare(table.Largest, smallest) < 0 || bytes.Compare(table.Smallest, largest) > 0 {
+				continue
+			}
+			selected[table.Filename] = struct{}{}
+			if bytes.Compare(table.Smallest, smallest) < 0 {
+				smallest = append(smallest[:0], table.Smallest...)
+			}
+			if bytes.Compare(table.Largest, largest) > 0 {
+				largest = append(largest[:0], table.Largest...)
+			}
+			changed = true
+		}
+	}
+
+	result := make([]TableMeta, 0, len(selected))
+	for _, table := range l0 {
+		if _, ok := selected[table.Filename]; ok {
+			result = append(result, table)
+		}
+	}
+	return result
+}
+
+func orderTableMetaForManifest(tables []TableMeta) {
+	if len(tables) == 0 {
+		return
+	}
+	ordered := groupTableMetaByLevel(tables)
+	flattened := make([]TableMeta, 0, len(tables))
+	for _, level := range ordered {
+		flattened = append(flattened, level.meta...)
+	}
+	copy(tables, flattened)
 }
 
 type compactionMergeIterator struct {

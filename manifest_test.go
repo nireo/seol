@@ -63,6 +63,12 @@ func TestDBManifestTracksFlushedTableMeta(t *testing.T) {
 	if got := string(meta.Largest); got != "omega" {
 		t.Fatalf("manifest largest: got %q, want %q", got, "omega")
 	}
+	if len(db.tableMeta) != 1 || db.tableMeta[0].Level != 0 {
+		t.Fatalf("in-memory table meta after flush: got %+v, want single L0 table", db.tableMeta)
+	}
+	if len(db.levels) != 1 || db.levels[0].level != 0 || len(db.levels[0].tables) != 1 {
+		t.Fatalf("in-memory levels after flush: got %+v, want one L0 table", db.levels)
+	}
 	if meta.SizeBytes <= 0 {
 		t.Fatalf("manifest size bytes: got %d, want > 0", meta.SizeBytes)
 	}
@@ -106,6 +112,12 @@ func TestDBCompactionRewritesManifest(t *testing.T) {
 	}
 	if got := string(meta.Largest); got != "shared" {
 		t.Fatalf("manifest largest after compact: got %q, want %q", got, "shared")
+	}
+	if meta.Level != 1 {
+		t.Fatalf("manifest level after compact: got %d, want 1", meta.Level)
+	}
+	if len(compactDB.levels) != 1 || compactDB.levels[0].level != 1 || len(compactDB.levels[0].tables) != 1 {
+		t.Fatalf("in-memory levels after compact: got %+v, want one L1 table", compactDB.levels)
 	}
 }
 
