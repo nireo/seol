@@ -2,6 +2,13 @@
 
 A fast embeddable Go LSMT key-value store. Uses many concepts from the WiscKey paper. Additionally the project aims to create very high performance Go data structures that can be used in any database.
 
+## Documentation
+
+System documentation lives in `docs/`.
+
+- Start with `docs/README.md`
+- Detailed subsystem pages cover the memtable, WAL, SSTables, value log, manifest, compaction, and file formats
+
 ## Benchmarks
 
 ### Bloom Filter Comparison
