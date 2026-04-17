@@ -16,12 +16,14 @@ import (
 	"github.com/nireo/seol/skiplist"
 )
 
-// ideas:
-// - block cache to limit disc reads
-// - bloom filter
-// - prefix sums on disc to save space on keys
-// - reuse read buffers to avoid too many allocations
-
+// sstable files are laid out as:
+//
+//	bloom filter | data blocks | block index | footer
+//
+// the bloom filter is stored first so negative point lookups can fail fast.
+// data blocks hold sorted length-prefixed entries. the index stores one record
+// per block using that block's first key, byte offset, and length. the footer
+// is fixed width and points back to the start of the index.
 const (
 	sstableBlockSize       int    = 4 * 1024 // 4kb
 	sstableMagic           uint32 = 0xFF12FF45
@@ -50,6 +52,9 @@ type leasedDataBlock struct {
 }
 
 func getDataBlock(length uint32) leasedDataBlock {
+	// most blocks are at or below the configured block size, so keep a pool of
+	// fixed-size buffers for the common read path and fall back to a dedicated
+	// allocation only for oversized blocks.
 	if int(length) > sstableBlockSize {
 		return leasedDataBlock{data: make([]byte, int(length))}
 	}
@@ -74,6 +79,8 @@ type cachedDataBlock struct {
 }
 
 func newCachedDataBlock(raw []byte) (*cachedDataBlock, error) {
+	// keep an owned copy of the raw block bytes so the cached block outlives any
+	// temporary read buffer, then precompute each entry offset once.
 	block := &cachedDataBlock{data: append([]byte(nil), raw...)}
 	ptr := 0
 	for ptr < len(block.data) {
@@ -94,6 +101,8 @@ func newCachedDataBlock(raw []byte) (*cachedDataBlock, error) {
 }
 
 func (b *cachedDataBlock) lookup(key []byte) []byte {
+	// entries are written in sorted key order, so binary search within the block
+	// avoids scanning it linearly on every point lookup.
 	idx := sort.Search(len(b.entryOffsets), func(i int) bool {
 		entryKey, _ := b.entryAt(i)
 		return bytes.Compare(entryKey, key) >= 0
@@ -139,6 +148,8 @@ func newDataBlockCache(maxEntries int) *dataBlockCache {
 	if maxEntries < shardCount {
 		shardCount = maxEntries
 	}
+	// spread blocks across a small fixed set of shards so reads usually take only
+	// one shard lock and hot offsets do not serialize through a single mutex.
 	perShard := (maxEntries + shardCount - 1) / shardCount
 	cache := &dataBlockCache{shards: make([]dataBlockCacheShard, shardCount)}
 	for i := range cache.shards {
@@ -199,6 +210,8 @@ func (c *dataBlockCache) shard(offset uint64) *dataBlockCacheShard {
 }
 
 func (s *dataBlockCacheShard) evictOldestLocked() {
+	// order can contain stale offsets when a block is replaced in place, so keep
+	// popping until we find one that is still present.
 	for len(s.order) > 0 {
 		oldest := s.order[0]
 		s.order = s.order[1:]
@@ -263,6 +276,8 @@ func (ti *tableIndex) encodeFullRange() []byte {
 }
 
 func (ti *tableIndex) decodeFullRange(data []byte) {
+	// the index is stored as back-to-back dataRange encodings with no count
+	// prefix, so decoding just walks until the byte slice is exhausted.
 	if len(data) == 0 {
 		return
 	}
@@ -280,6 +295,8 @@ func (ti *tableIndex) findDataRange(key []byte) *dataRange {
 		return nil
 	}
 
+	// find the first range whose first key is greater than the target, then step
+	// back to the range that could still contain it.
 	idx := sort.Search(len(ti.ranges), func(i int) bool {
 		return bytes.Compare(ti.ranges[i].firstKey, key) > 0
 	})
@@ -310,6 +327,8 @@ func countEntries(sk *skiplist.Skiplist) int {
 }
 
 func prepareBloomFilter(file *os.File, sk *skiplist.Skiplist) (*bloom.Filter, int, error) {
+	// reserve the bloom filter bytes up front so blocks and the index can be
+	// streamed once, then backfill the filter after all keys have been added.
 	filter := bloom.NewFor(countEntries(sk), bloomFalsePositiveRate)
 	filterData, err := filter.MarshalBinary()
 	if err != nil {
@@ -322,6 +341,7 @@ func prepareBloomFilter(file *os.File, sk *skiplist.Skiplist) (*bloom.Filter, in
 }
 
 func appendBlockEntry(block []byte, key, value []byte) []byte {
+	// each block is a tight byte buffer of length-prefixed entries.
 	entrySize := entryMetaSize + len(key) + len(value)
 	entryOffset := len(block)
 	block = block[:entryOffset+entrySize]
@@ -333,6 +353,8 @@ func appendBlockEntry(block []byte, key, value []byte) []byte {
 }
 
 func writeDataBlocks(bw *bufio.Writer, sk *skiplist.Skiplist, filter *bloom.Filter, startOffset uint64) (tableIndex, uint64, error) {
+	// stream the sorted memtable into fixed-size blocks while recording one index
+	// entry per block: the first key, on-disk offset, and encoded length.
 	idx := tableIndex{}
 	it := sk.NewIterator()
 	defer it.Close()
@@ -346,6 +368,7 @@ func writeDataBlocks(bw *bufio.Writer, sk *skiplist.Skiplist, filter *bloom.Filt
 			return nil
 		}
 
+		// firstKey and offset were captured when the block became non-empty.
 		currentRange.length = uint32(len(block))
 		idx.ranges = append(idx.ranges, currentRange)
 		if _, err := bw.Write(block); err != nil {
@@ -390,6 +413,9 @@ func writeDataBlocks(bw *bufio.Writer, sk *skiplist.Skiplist, filter *bloom.Filt
 }
 
 func writeIndexAndFooter(bw *bufio.Writer, idx tableIndex, indexOffset uint64) error {
+	// file layout is: bloom filter, data blocks, index, footer. the footer is a
+	// fixed-width trailer that points back to the start of the variable-sized
+	// index.
 	if _, err := bw.Write(idx.encodeFullRange()); err != nil {
 		return err
 	}
@@ -403,6 +429,8 @@ func writeIndexAndFooter(bw *bufio.Writer, idx tableIndex, indexOffset uint64) e
 }
 
 func loadBloomFilter(file *os.File, fileSize int64) (*bloom.Filter, int, error) {
+	// the bloom filter lives at the front of the file, but its exact byte size is
+	// embedded in the bloom header, so read and validate that header first.
 	if fileSize < int64(sstableFooterSize) {
 		return nil, 0, fmt.Errorf("sstable: file too small")
 	}
@@ -440,6 +468,8 @@ func loadBloomFilter(file *os.File, fileSize int64) (*bloom.Filter, int, error) 
 }
 
 func readIndexData(file *os.File, fileSize int64, bloomSize int) ([]byte, error) {
+	// the footer is always the last bytes in the file and tells us where the
+	// index begins, so the whole index can be sliced out with one read.
 	var footer [sstableFooterSize]byte
 	footerOffset := fileSize - int64(sstableFooterSize)
 	if _, err := file.ReadAt(footer[:], footerOffset); err != nil {
@@ -469,6 +499,7 @@ func readIndexData(file *os.File, fileSize int64, bloomSize int) ([]byte, error)
 	return indexData, nil
 }
 
+// Flush writes sk to a new sstable file in baseDir.
 func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 	id := sstableID()
 	path := filepath.Join(baseDir, id)
@@ -517,6 +548,8 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 		return nil, err
 	}
 
+	// the bloom filter bytes were reserved at the start of the file before any
+	// keys were seen, so write them back after the filter has been fully built.
 	filterData, err := filter.MarshalBinary()
 	if err != nil {
 		return nil, err
@@ -533,6 +566,7 @@ func Flush(baseDir string, sk *skiplist.Skiplist) (*Table, error) {
 	return sst, nil
 }
 
+// Open loads an existing sstable from path.
 func Open(path string) (*Table, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -550,6 +584,8 @@ func Open(path string) (*Table, error) {
 		return nil, err
 	}
 
+	// validate both ends of the file before decoding the in-memory structures so
+	// malformed tables fail early.
 	filter, bloomSize, err := loadBloomFilter(file, stat.Size())
 	if err != nil {
 		return nil, err
@@ -569,6 +605,7 @@ func Open(path string) (*Table, error) {
 	return sst, nil
 }
 
+// Table is an immutable sstable backed by an on-disk file.
 type Table struct {
 	idx        tableIndex
 	filter     *bloom.Filter
@@ -580,6 +617,7 @@ type Table struct {
 	sizeBytes  int64
 }
 
+// Metadata describes an sstable without exposing its internals.
 type Metadata struct {
 	Path      string
 	Smallest  []byte
@@ -587,6 +625,7 @@ type Metadata struct {
 	SizeBytes int64
 }
 
+// Iterator walks a table in sorted key order.
 type Iterator struct {
 	table    *Table
 	rangeIdx int
@@ -595,6 +634,7 @@ type Iterator struct {
 	err      error
 }
 
+// Get returns a copy of the value for key, or nil when the key is absent.
 func (s *Table) Get(key []byte) ([]byte, error) {
 	if s.filter != nil && !s.filter.Contains(key) {
 		return nil, nil
@@ -616,6 +656,7 @@ func (s *Table) Get(key []byte) ([]byte, error) {
 	return append([]byte(nil), value...), nil
 }
 
+// Scan visits every entry in sorted key order.
 func (s *Table) Scan(fn func(key, value []byte) error) error {
 	if fn == nil {
 		return nil
@@ -638,6 +679,7 @@ func (s *Table) Scan(fn func(key, value []byte) error) error {
 	return nil
 }
 
+// Metadata returns a copy of the table metadata.
 func (s *Table) Metadata() Metadata {
 	if s == nil {
 		return Metadata{}
@@ -650,6 +692,7 @@ func (s *Table) Metadata() Metadata {
 	}
 }
 
+// Close releases the underlying file and clears cached blocks.
 func (s *Table) Close() error {
 	if s.blockCache != nil {
 		s.blockCache.clear()
@@ -657,10 +700,12 @@ func (s *Table) Close() error {
 	return s.f.Close()
 }
 
+// NewIterator returns an iterator positioned before the first entry.
 func (s *Table) NewIterator() *Iterator {
 	return &Iterator{table: s, rangeIdx: -1, entryIdx: -1}
 }
 
+// Rewind moves the iterator to the first entry.
 func (it *Iterator) Rewind() {
 	if it == nil {
 		return
@@ -672,10 +717,12 @@ func (it *Iterator) Rewind() {
 	it.loadCurrent()
 }
 
+// Valid reports whether the iterator points at an entry.
 func (it *Iterator) Valid() bool {
 	return it != nil && it.err == nil && it.block != nil && it.rangeIdx >= 0 && it.rangeIdx < len(it.table.idx.ranges) && it.entryIdx >= 0 && it.entryIdx < len(it.block.entryOffsets)
 }
 
+// Key returns the current key.
 func (it *Iterator) Key() []byte {
 	if !it.Valid() {
 		return nil
@@ -684,6 +731,7 @@ func (it *Iterator) Key() []byte {
 	return key
 }
 
+// Value returns the current value.
 func (it *Iterator) Value() []byte {
 	if !it.Valid() {
 		return nil
@@ -692,6 +740,7 @@ func (it *Iterator) Value() []byte {
 	return value
 }
 
+// Next advances the iterator by one entry.
 func (it *Iterator) Next() {
 	if !it.Valid() {
 		return
@@ -700,6 +749,7 @@ func (it *Iterator) Next() {
 	it.loadCurrent()
 }
 
+// Err returns the first iterator error, if any.
 func (it *Iterator) Err() error {
 	if it == nil {
 		return nil
@@ -711,6 +761,7 @@ func (it *Iterator) loadCurrent() {
 	if it == nil || it.err != nil || it.table == nil {
 		return
 	}
+	// keep advancing ranges until we land on a block that still has entries.
 	for it.rangeIdx >= 0 && it.rangeIdx < len(it.table.idx.ranges) {
 		if it.block == nil {
 			block, err := it.table.getCachedBlock(&it.table.idx.ranges[it.rangeIdx])
@@ -736,6 +787,7 @@ func (s *Table) getCachedBlock(ra *dataRange) (*cachedDataBlock, error) {
 		return block, nil
 	}
 
+	// cache parsed blocks by file offset so repeated reads do not re-decode them.
 	raw := getDataBlock(ra.length)
 	defer putDataBlock(raw)
 	if _, err := s.f.ReadAt(raw.data, int64(ra.offset)); err != nil && err != io.EOF {
@@ -764,6 +816,8 @@ func (s *Table) loadMetadata() error {
 		s.largest = nil
 		return nil
 	}
+	// the index stores only the first key of each block, so the smallest key is
+	// immediate but the largest key has to come from the last parsed block.
 	s.smallest = append(s.smallest[:0], s.idx.ranges[0].firstKey...)
 	lastRange := &s.idx.ranges[len(s.idx.ranges)-1]
 	block, err := s.getCachedBlock(lastRange)

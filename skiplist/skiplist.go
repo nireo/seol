@@ -31,6 +31,7 @@ type arena struct {
 	buf []byte
 }
 
+// Skiplist stores keys in sorted order inside an arena-backed skiplist.
 type Skiplist struct {
 	height  atomic.Int32
 	head    *node
@@ -39,6 +40,7 @@ type Skiplist struct {
 	onClose func()
 }
 
+// Iterator walks a skiplist in sorted key order.
 type Iterator struct {
 	list *Skiplist
 	n    *node
@@ -56,6 +58,7 @@ func (s *arena) size() int64 {
 }
 
 func (s *arena) putNode(height int) uint32 {
+	// keep every node 64-bit aligned so atomic fields stay naturally aligned.
 	unusedSize := (maxHeight - height) * offsetSize
 	l := uint32(maxNodeSize - unusedSize + nodeAlign)
 	n := s.n.Add(l)
@@ -147,6 +150,7 @@ func newNode(arena *arena, key []byte, v []byte, height int) *node {
 	return node
 }
 
+// New allocates a skiplist backed by an arena of arenaSize bytes.
 func New(arenaSize int64) *Skiplist {
 	arena := newArena(arenaSize)
 	head := newNode(arena, nil, nil, maxHeight)
@@ -192,6 +196,11 @@ func (s *Skiplist) getNext(nd *node, height int) *node {
 	return s.arena.getNode(nd.getNextOffset(height))
 }
 
+// findNear returns the closest node around key.
+//
+// when less is false it finds the first node >= key.
+// when less is true it finds the last node <= key.
+// when allowEqual is false an exact match is skipped in the requested direction.
 func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool) {
 	x := s.head
 	level := int(s.getHeight() - 1)
@@ -266,6 +275,7 @@ func (s *Skiplist) getHeight() int32 {
 	return s.height.Load()
 }
 
+// Put inserts or overwrites key with v.
 func (s *Skiplist) Put(key []byte, v []byte) {
 	listHeight := s.getHeight()
 	var prev [maxHeight + 1]*node
@@ -309,6 +319,7 @@ func (s *Skiplist) Put(key []byte, v []byte) {
 				break
 			}
 
+			// another writer changed the splice, so recompute it for this level.
 			prev[i], next[i] = s.findSpliceForLevel(key, prev[i], i)
 			if prev[i] == next[i] {
 				if i != 0 {
@@ -321,8 +332,9 @@ func (s *Skiplist) Put(key []byte, v []byte) {
 	}
 }
 
+// Empty reports whether the skiplist contains any entries.
 func (s *Skiplist) Empty() bool {
-	return s.findLast() == nil
+	return s.getNext(s.head, 0) == nil
 }
 
 func (s *Skiplist) findLast() *node {
@@ -344,12 +356,10 @@ func (s *Skiplist) findLast() *node {
 	}
 }
 
+// Get returns the value for key, or nil when the key is absent.
 func (s *Skiplist) Get(key []byte) []byte {
-	n, _ := s.findNear(key, false, true)
-	if n == nil {
-		return nil
-	}
-	if !bytes.Equal(key, n.key(s.arena)) {
+	n, equal := s.findNear(key, false, true)
+	if !equal {
 		return nil
 	}
 
@@ -357,15 +367,18 @@ func (s *Skiplist) Get(key []byte) []byte {
 	return s.arena.getVal(valOffset, valSize)
 }
 
+// NewIterator returns an iterator that must be closed when no longer needed.
 func (s *Skiplist) NewIterator() *Iterator {
 	s.incrRef()
 	return &Iterator{list: s}
 }
 
+// MemSize returns the bytes currently allocated from the arena.
 func (s *Skiplist) MemSize() int64 {
 	return s.arena.size()
 }
 
+// Close releases the iterator's reference to the skiplist.
 func (it *Iterator) Close() {
 	if it.list == nil {
 		return
@@ -375,10 +388,12 @@ func (it *Iterator) Close() {
 	it.n = nil
 }
 
+// Valid reports whether the iterator points at an entry.
 func (it *Iterator) Valid() bool {
 	return it != nil && it.n != nil
 }
 
+// Key returns the current key.
 func (it *Iterator) Key() []byte {
 	if !it.Valid() {
 		return nil
@@ -386,6 +401,7 @@ func (it *Iterator) Key() []byte {
 	return it.n.key(it.list.arena)
 }
 
+// Value returns the current value.
 func (it *Iterator) Value() []byte {
 	if !it.Valid() {
 		return nil
@@ -394,26 +410,32 @@ func (it *Iterator) Value() []byte {
 	return it.list.arena.getVal(valOffset, valSize)
 }
 
+// Seek moves the iterator to the first key greater than or equal to target.
 func (it *Iterator) Seek(target []byte) {
 	it.n, _ = it.list.findNear(target, false, true)
 }
 
+// SeekForPrev moves the iterator to the last key less than or equal to target.
 func (it *Iterator) SeekForPrev(target []byte) {
 	it.n, _ = it.list.findNear(target, true, true)
 }
 
+// SeekToFirst moves the iterator to the first key.
 func (it *Iterator) SeekToFirst() {
 	it.n = it.list.getNext(it.list.head, 0)
 }
 
+// SeekToLast moves the iterator to the last key.
 func (it *Iterator) SeekToLast() {
 	it.n = it.list.findLast()
 }
 
+// Rewind moves the iterator to the first key.
 func (it *Iterator) Rewind() {
 	it.SeekToFirst()
 }
 
+// Next advances the iterator by one key.
 func (it *Iterator) Next() {
 	if !it.Valid() {
 		return
@@ -421,6 +443,7 @@ func (it *Iterator) Next() {
 	it.n = it.list.getNext(it.n, 0)
 }
 
+// Prev moves the iterator back by one key.
 func (it *Iterator) Prev() {
 	if !it.Valid() {
 		it.SeekToLast()
