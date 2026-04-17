@@ -642,6 +642,13 @@ func stopDBWithoutFlush(t *testing.T, db *DB) {
 			t.Fatalf("close sstable: %v", err)
 		}
 	}
+
+	db.mu.Lock()
+	if err := db.closeDirectoryLockLocked(); err != nil {
+		db.mu.Unlock()
+		t.Fatalf("close directory lock: %v", err)
+	}
+	db.mu.Unlock()
 }
 
 func assertNoWALFiles(t *testing.T, dir string) {

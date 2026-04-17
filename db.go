@@ -85,6 +85,7 @@ type dbReadState struct {
 
 type DB struct {
 	dir                     string
+	dirLock                 directoryLock
 	memtableMaxBytes        int64
 	walSyncInterval         time.Duration
 	valueLogSegmentMaxBytes int64
@@ -234,6 +235,17 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 		return nil, err
 	}
 
+	dirLock, err := acquireDirectoryLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	releaseDirLock := true
+	defer func() {
+		if releaseDirLock {
+			_ = dirLock.close()
+		}
+	}()
+
 	_, walPaths, err := scanDataFiles(dir)
 	if err != nil {
 		return nil, err
@@ -277,6 +289,7 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 	currentWalPaths = append(currentWalPaths, activeWal.path)
 	db := &DB{
 		dir:                     dir,
+		dirLock:                 dirLock,
 		memtableMaxBytes:        opts.MemtableMaxBytes,
 		walSyncInterval:         opts.WALSyncInterval,
 		valueLogSegmentMaxBytes: opts.ValueLogSegmentMaxBytes,
@@ -303,6 +316,7 @@ func openDB(dir string, opts Options, flushFn func(baseDir string, sk *skiplist.
 	db.flushWg.Add(1)
 	go db.flushLoop()
 
+	releaseDirLock = false
 	return db, nil
 }
 
@@ -399,8 +413,9 @@ func (db *DB) Close() error {
 	var toFlush *immutableMemtable
 	if db.memtable != nil && !db.memtable.Empty() {
 		if err := db.activeWal.close(); err != nil {
+			lockErr := db.closeDirectoryLockLocked()
 			db.mu.Unlock()
-			return fmt.Errorf("seol: close wal: %w", err)
+			return firstError(fmt.Errorf("seol: close wal: %w", err), lockErr)
 		}
 		toFlush = &immutableMemtable{
 			table:    db.memtable,
@@ -482,7 +497,17 @@ func (db *DB) closeStorageLocked(extraErr error) error {
 	for _, sst := range db.sstables {
 		closeErr = firstError(closeErr, sst.Close())
 	}
+	closeErr = firstError(closeErr, db.closeDirectoryLockLocked())
 	return closeErr
+}
+
+func (db *DB) closeDirectoryLockLocked() error {
+	if db.dirLock == nil {
+		return nil
+	}
+	err := db.dirLock.close()
+	db.dirLock = nil
+	return err
 }
 
 func firstError(err, next error) error {
