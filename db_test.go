@@ -394,6 +394,44 @@ func TestDBAsyncWritesReadYourWriteAndPersistOnClose(t *testing.T) {
 	}
 }
 
+func TestDBDurableWritesShareSyncWithinBatchWindow(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir, Options{
+		MemtableMaxBytes: 1 << 20,
+		WALSyncInterval:  0,
+		WriteBatchWindow: 20 * time.Millisecond,
+	}, sstable.Flush)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if !db.beginSubmit() {
+		t.Fatal("beginSubmit: db closed")
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- db.Put([]byte("alpha"), []byte("one"))
+	}()
+
+	time.Sleep(2 * time.Millisecond)
+	go func() {
+		errCh <- db.Put([]byte("beta"), []byte("two"))
+	}()
+	db.finishSubmit()
+
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+
+	if got := db.activeWal.syncCountValue(); got != 1 {
+		t.Fatalf("sync count: got %d, want 1 shared sync", got)
+	}
+}
+
 func TestDBConcurrentPutAndCloseDoesNotDeadlock(t *testing.T) {
 	dir := t.TempDir()
 	db, err := openDB(dir, Options{MemtableMaxBytes: 1 << 20}, sstable.Flush)

@@ -38,14 +38,17 @@ func (leveledCompactionPlanner) Plan(dir string, opts Options) (*compactionPlan,
 	if err != nil {
 		return nil, err
 	}
+
 	levels := groupTableMetaByLevel(manifest.Tables())
 	if len(levels) == 0 || len(levels[0].meta) == 0 {
 		return nil, nil
 	}
+
 	sourceTables := selectL0CompactionSource(levels[0].meta)
 	smallest, largest := tableMetaBounds(sourceTables)
 	targetTables := overlappingTableMeta(levels, 1, smallest, largest)
 	maxLevel := maxTableLevel(levels)
+
 	return &compactionPlan{
 		sourceLevel:       0,
 		targetLevel:       1,
@@ -422,6 +425,7 @@ func cloneTableLevels(src []tableLevelState) []tableLevelState {
 	if len(src) == 0 {
 		return nil
 	}
+
 	out := make([]tableLevelState, len(src))
 	for i := range src {
 		out[i] = tableLevelState{
@@ -430,6 +434,7 @@ func cloneTableLevels(src []tableLevelState) []tableLevelState {
 			tables: append([]*sstable.Table(nil), src[i].tables...),
 		}
 	}
+
 	return out
 }
 

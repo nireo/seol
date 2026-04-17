@@ -515,9 +515,32 @@ func (db *DB) writeLoop() {
 
 func (db *DB) collectWriteBatch(first *writeRequest, batch []*writeRequest) ([]*writeRequest, bool) {
 	batch = append(batch[:0], first)
+	batch, closing := drainQueuedWrites(db.writeCh, batch)
+	if closing || len(batch) == cap(batch) || !db.shouldWaitForGroupCommit() {
+		return batch, closing
+	}
+
+	time.Sleep(db.writeBatchWindow)
+	return drainQueuedWrites(db.writeCh, batch)
+}
+
+func (db *DB) shouldWaitForGroupCommit() bool {
+	if db.writeBatchWindow <= 0 {
+		return false
+	}
+	if db.asyncWrites && db.walSyncInterval > 0 {
+		return false
+	}
+	if len(db.writeCh) > 0 {
+		return true
+	}
+	return db.submitters.Load() > 0
+}
+
+func drainQueuedWrites(writeCh <-chan *writeRequest, batch []*writeRequest) ([]*writeRequest, bool) {
 	for len(batch) < cap(batch) {
 		select {
-		case req := <-db.writeCh:
+		case req := <-writeCh:
 			if req == nil {
 				return batch, true
 			}
